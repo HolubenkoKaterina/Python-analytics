@@ -1,0 +1,22 @@
+# gdown для скачивания с гугл диска
+import gdown
+import pandas as pd
+
+# URL файла на Google Диске
+url = 'https://drive.google.com/file/d/1QpCcE4U8NIhznbqf0kdeO2ITKPEs9OSm/view?usp=sharing'
+
+# Извлечение идентификатора файла из URL
+# адрес разделен по "/", 5 элемент взят из адреса
+file_id = url.split('/')[5]
+download_url = f'https://drive.google.com/uc?id={file_id}'
+
+# Скачивание файла
+output = 'data.csv'  # Укажите имя файла, который будет сохранен
+gdown.download(download_url, output, quiet=False)
+
+# Чтение и отображение содержимого CSV файла
+try:
+    df = pd.read_csv(output)
+    print(df)
+except Exception as e:
+    print(f"Ошибка при чтении файла: {e}")
