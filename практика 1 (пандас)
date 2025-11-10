@@ -1,0 +1,153 @@
+"""Завдання: Аналіз даних про бронювання готелів
+1. Імпорт даних
+Імпортуйте бібліотеку pandas як pd."""
+from itertools import groupby
+import pandas as pd
+from numpy.ma.core import count
+from numpy.ma.extras import average
+from pandas import DataFrame
+"""Завантажте датасет bookings.csv з роздільником ",".
+Перевірте:
+розмір таблиці,
+типи змінних,
+виведіть перші 7 рядків, щоб подивитися на дані."""
+dataset = pd.read_csv("C:/Users/user/Desktop/hotel_bookings.csv", sep="," )
+#print(dataset.shape)
+#print(dataset.dtypes)
+#print(dataset.head(7))
+"""2. Форматування назв колонок
+Приведіть назви колонок до нижнього регістру
+і замініть пробіли на знак нижнього підкреслення _.
+Наприклад:
+Is Canceled → is_canceled
+Підказки:
+може знадобитися rename, str.lower, str.replace, columns"""
+dataset.columns = dataset.columns.str.lower().str.replace(" ", "_")
+#print(dataset.head())
+print(dataset.columns)
+"""3. Користувачі з яких країн зробили найбільше успішних бронювань?
+Успішне бронювання — це коли is_canceled = 0.
+Визначте топ-5 країн."""
+#successful_count  = dataset[dataset['is_canceled'] ==0].shape[0]
+#print(successful_count)
+#top_countries = (
+#dataset[dataset['is_canceled'] == 0]['country'].value_counts().head(5))
+#print(top_countries)
+"""4. На скільки ночей у середньому бронюють готелі різних типів?
+Обчисліть середнє значення stays_total_nights
+для кожного типу готелю (City Hotel, Resort Hotel).
+Округліть до двох знаків після коми."""
+'''dataset['stays_total_nights'] = dataset['stays_in_weekend_nights']+ dataset ['stays_in_week_nights']
+City_Hotel = dataset['hotel'] =='City Hotel'
+Resort_Hotel = dataset['hotel'] =='Resort Hotel'
+aver_city = dataset[City_Hotel]['stays_total_nights'].mean().round(2)
+aver_Resort = dataset[Resort_Hotel]['stays_total_nights'].mean().round(2)
+print(aver_city, aver_Resort)'''
+
+"""5. Відмінність типів номерів
+Іноді тип отриманого клієнтом номера (assigned_room_type)
+відрізняється від початково заброньованого (reserved_room_type).
+Порахуйте, скільки таких випадків у датасеті."""
+"""dataset['another'] = dataset['assigned_room_type'] != dataset['reserved_room_type']
+num_mismatches = dataset['another'].sum()
+print(num_mismatches)"""
+
+"""6. Аналіз дат прибуття
+На який місяць найчастіше оформлювали бронювання у 2016 році?
+Чи змінився найпопулярніший місяць у 2017 році?
+Потім:
+Сгрупуйте дані за роками.
+Перевірте, на який місяць (arrival_date_month)
+бронювання готелів типу City Hotel
+найчастіше скасовувалися у 2015, 2016, 2017 роках.
+Підказка:
+Використовуйте groupby та потрібну колонку для підрахунку."""
+# ===== 2016 год =====
+# Фильтруем строки за 2016
+"""data_2016 = dataset[dataset['arrival_date_year'] == 2016]
+# Группируем по месяцам и считаем количество бронирований
+month_counts_2016 = data_2016.groupby('arrival_date_month')['hotel'].count()
+# Сортируем по количеству бронирований (убывание)
+month_counts_2016_sorted = month_counts_2016.sort_values(ascending=False)
+# Берём месяц с максимумом
+most_popular_month_2016 = month_counts_2016_sorted.index[0]
+print("Самый популярный месяц 2016:", most_popular_month_2016)
+# ===== 2017 год =====
+# Фильтруем строки за 2017
+data_2017 = dataset[dataset['arrival_date_year'] == 2017]
+# Группируем по месяцам и считаем количество бронирований
+month_counts_2017 = data_2017.groupby('arrival_date_month')['hotel'].count()
+# Сортируем по количеству бронирований (убывание)
+month_counts_2017_sorted = month_counts_2017.sort_values(ascending=False)
+# Берём месяц с максимумом
+most_popular_month_2017 = month_counts_2017_sorted.index[0]
+print("Самый популярный месяц 2017:", most_popular_month_2017)
+# ===== Сравнение =====
+if most_popular_month_2016 == most_popular_month_2017:
+    print("Популярный месяц не изменился.")
+else:
+    print("Популярный месяц изменился.")"""
+
+"""7. Порівняння числових характеристик
+Подивіться на змінні:
+adults
+children
+babies
+Яка з них має найбільше середнє значення?"""
+"""adults_count = dataset['adults'].mean().round(2)
+children_count = dataset['children'].mean().round(2)
+babies_count = dataset['babies'].mean().round(2)
+print(adults_count, children_count, babies_count)
+list_count = {'adults': float(adults_count), 'children':float(children_count), 'babies': float(babies_count)}
+max_key = max(list_count, key=list_count.get)
+print(list_count[max_key])"""
+
+"""8. Створіть нову колонку
+Створіть колонку total_kids, об’єднавши children і babies.
+Для якого типу готелів середнє значення total_kids є найбільшим?
+(округліть до 2 знаків після коми)"""
+#Создаём колонку total_kids
+dataset['total_kids'] = dataset['children'] + dataset['babies']
+# Фильтруем по типу отеля
+"""total_kids_City_Hotel = dataset[dataset['hotel'] == 'City Hotel']
+total_kids_Resort_Hotel = dataset[dataset['hotel'] == 'Resort Hotel']
+# Считаем среднее и округляем
+aver_total_kids_City_Hotel = (total_kids_City_Hotel['total_kids'].sum() / total_kids_City_Hotel['total_kids'].count()).round(2)
+aver_total_kids_Resort_Hotel = (total_kids_Resort_Hotel['total_kids'].sum() / total_kids_Resort_Hotel['total_kids'].count()).round(2)
+# Сравниваем и выводим результат
+if aver_total_kids_City_Hotel > aver_total_kids_Resort_Hotel:
+    print(f'Больше в City_Hotel: {aver_total_kids_City_Hotel}')
+else:
+    print(f'Больше в Resort Hotel: {aver_total_kids_Resort_Hotel}')"""
+
+"""9. Показник відтоку клієнтів (Churn Rate)
+Churn Rate (відтік) — це відсоток користувачів, які відмовилися від послуг.
+У нашому випадку — це відсоток клієнтів, що скасували бронювання (is_canceled = 1).
+Створіть колонку has_kids:
+True, якщо при бронюванні було вказано хоча б одну дитину (total_kids > 0);
+False — якщо дітей не було.
+Порахуйте churn rate для кожної групи (has_kids = True/False).
+Вкажіть, у якої групи показник відтоку вищий,
+округливши результат до 2 знаків після коми
+(тобто 0.24563 → 24.56%)."""
+# группы
+has_no_kids = dataset[dataset['total_kids'] < 1]
+has_kids = dataset[dataset['total_kids'] > 0]
+# число отмен в каждой группе
+canceled_kids = has_kids[has_kids['is_canceled'] == 1].shape[0]
+canceled_no_kids = has_no_kids[has_no_kids['is_canceled'] == 1].shape[0]
+# общее количество записей в группах
+total_kids = has_kids.shape[0]
+total_no_kids = has_no_kids.shape[0]
+# защита от деления на ноль и вычисление в процентах
+if total_kids > 0:
+    churn_rate_kids = (canceled_kids / total_kids) * 100
+else:
+    churn_rate_kids = float('nan')
+if total_no_kids > 0:
+    churn_rate_no_kids = (canceled_no_kids / total_no_kids) * 100
+else:
+    churn_rate_no_kids = float('nan')
+# округление до 2 знаков и вывод
+print("Churn Rate для клиентов с детьми:    ", round(churn_rate_kids, 2), "%")
+print("Churn Rate для клиентов без детей:  ", round(churn_rate_no_kids, 2), "%")
