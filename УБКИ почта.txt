@@ -1,0 +1,57 @@
+import os
+import pandas as pd
+import openpyxl
+
+# ====== НАСТРОЙКИ ======
+SOURCE_DIR = r"C:\Users\User\Desktop\УБКЫ"
+OUTPUT_FILE = r"C:\Users\User\Desktop\УБКЫ_emails.xlsx"
+
+all_data = []
+
+# ====== ЧТЕНИЕ ФАЙЛОВ ======
+for root, dirs, files in os.walk(SOURCE_DIR):
+    for file in files:
+        if file.lower().endswith(".xlsx"):
+            file_path = os.path.join(root, file)
+
+            try:
+                df = pd.read_excel(
+                    file_path,
+                    sheet_name=0,
+                    dtype=str
+                )
+
+                # Проверяем, что нужные колонки есть
+                required_cols = {"inn", "actual_date", "value"}
+                if not required_cols.issubset(df.columns):
+                    continue
+
+                df = df[list(required_cols)]
+
+                all_data.append(df)
+
+            except Exception as e:
+                print(f"Ошибка чтения файла: {file_path}")
+                print(e)
+
+# ====== ОБЪЕДИНЕНИЕ ======
+if not all_data:
+    raise ValueError("Не найдено ни одного подходящего файла")
+
+result = pd.concat(all_data, ignore_index=True)
+
+# ====== ФИЛЬТР ТОЛЬКО EMAIL ======
+result["value"] = result["value"].str.strip()
+result = result[result["value"].str.contains("@", na=False)]
+
+# ====== СОРТИРОВКА ======
+result["inn"] = result["inn"].str.strip()
+result = result.sort_values(by="inn")
+
+# ====== СОХРАНЕНИЕ ======
+result.to_excel(OUTPUT_FILE, index=False)
+
+print("Готово!")
+print(f"Файл сохранён: {OUTPUT_FILE}")
+print(f"Строк: {len(result)}")
+
