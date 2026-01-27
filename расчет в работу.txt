@@ -1,0 +1,390 @@
+import pandas as pd
+from decimal import Decimal
+import warnings
+import os
+from datetime import datetime
+
+warnings.filterwarnings(
+    "ignore",
+    message="Could not infer format",
+    category=UserWarning
+)
+
+# ===============================
+# 1. ПУТИ
+# ===============================
+SRC_FILE = r"C:\Users\User\Desktop\МИКС 21 в работу 14.01_АКЦИЯ.xlsx"
+OUT_FILE = r"C:\Users\User\Desktop\ВКЛАДКА В РАБОТУ.xlsx"
+
+print("▶️ СТАРТ")
+
+# ===============================
+# 2. ВСПОМОГАТЕЛЬНЫЕ
+# ===============================
+
+def norm(x):
+    return str(x).lower().strip()
+def get_excel_text(ws, row_idx, col_name, df_columns):
+    excel_row = row_idx + 2
+    excel_col = df_columns.get_loc(col_name) + 1
+    cell = ws.cell(row=excel_row, column=excel_col)
+
+    if cell.value is None:
+        return None
+
+    # если это дата — возвращаем как строку, как в Excel
+    if isinstance(cell.value, datetime):
+        return cell.value.strftime("%d.%m.%Y")
+
+    # всё остальное — как есть
+    return str(cell.value)
+def normalize_num(s):
+    if pd.isna(s):
+        return None
+    return str(s).replace(".0", "").strip()
+def normalize_contract_value(x):
+    if pd.isna(x):
+        return None
+
+    # если число — оставляем числом
+    if isinstance(x, (int, float)):
+        if float(x).is_integer():
+            return int(x)
+        return x
+
+    s = str(x).strip().replace("\xa0", " ")
+
+    # если строка состоит только из цифр → число
+    if s.isdigit():
+        return int(s)
+
+    # иначе текст
+    return s
+
+# ===============================
+# 3. ЗАГРУЗКА ФАЙЛА (БЕЗ dtype=str)
+# ===============================
+xls = pd.ExcelFile(SRC_FILE)
+sheets = {s: pd.read_excel(xls, sheet_name=s) for s in xls.sheet_names}
+# ===============================
+# 3.1 ЧАСТИНА УБКІ (ІПН -> текст)
+# ===============================
+ubki_sheet = next((s for s in sheets if "убк" in norm(s)), None)
+print("Найден лист УБКІ:", ubki_sheet)
+ubki_map = {}
+
+if ubki_sheet is not None:
+    df_ubki = sheets[ubki_sheet].copy()
+    df_ubki.columns = df_ubki.columns.str.strip()
+
+    # колонка ІПН
+    COL_UBKI_IPN = next(
+        (c for c in df_ubki.columns if "іпн" in norm(c)),
+        None
+    )
+    if COL_UBKI_IPN is None:
+        raise ValueError(f"❌ На листе '{ubki_sheet}' не найдена колонка ІПН")
+
+    # колонка с текстом запроса
+    COL_UBKI_TXT = next(
+        (
+            c for c in df_ubki.columns
+            if any(k in norm(c) for k in ["част", "запрос", "запит", "текст"])
+        ),
+        None
+    )
+
+    if COL_UBKI_TXT is None:
+        raise ValueError(f"❌ На листе '{ubki_sheet}' не найдена колонка с текстом УБКІ")
+
+    # нормализуем ІПН
+    df_ubki[COL_UBKI_IPN] = df_ubki[COL_UBKI_IPN].astype(str).str.strip()
+
+    # строим словарь ІПН -> текст
+    ubki_map = (
+        df_ubki
+        .dropna(subset=[COL_UBKI_IPN, COL_UBKI_TXT])
+        .drop_duplicates(subset=[COL_UBKI_IPN], keep="first")
+        .set_index(COL_UBKI_IPN)[COL_UBKI_TXT]
+        .to_dict()
+    )
+
+    print(f"УБКІ: найден лист '{ubki_sheet}', строк в маппинге: {len(ubki_map)}")
+else:
+    print("УБКІ: лист не найден, колонка будет пустой.")
+
+# ===============================
+# ПОИСК ВКЛАДКИ "КАТЕГОРИЯ"
+# ===============================
+category_sheet = next(
+    (s for s in sheets if "категор" in norm(s)),
+    None
+)
+
+category_value = None
+
+if category_sheet is not None:
+    # читаем ячейку A1 как текст
+    raw_df = pd.read_excel(
+        SRC_FILE,
+        sheet_name=category_sheet,
+        header=None
+    )
+
+    if not raw_df.empty and pd.notna(raw_df.iat[0, 0]):
+        category_value = str(raw_df.iat[0, 0]).strip()
+
+
+# ===============================
+# 4. ИСХОДНИК
+# ===============================
+from openpyxl import load_workbook
+wb_src = load_workbook(SRC_FILE, data_only=True)
+
+src_sheet = next(s for s in sheets if "исходник" in norm(s))
+ws_src = wb_src[src_sheet]
+df_src = pd.read_excel(SRC_FILE, sheet_name=src_sheet)
+df_src.columns = df_src.columns.str.strip()
+
+# ===============================
+# 5. ВКЛАДКА "В РОБОТУ"
+# ===============================
+def is_work_sheet(name: str) -> bool:
+    n = norm(name)
+    n = n.replace("_", "").replace("-", "").replace(" ", "")
+    return ("робот" in n) or ("работ" in n)   # UA "роботу" и RU "работу"
+
+work_sheet = next(
+    (s for s in sheets if is_work_sheet(s)),
+    None
+)
+
+print("Найден лист В роботу:", work_sheet)
+
+WORK_COLUMNS = [
+    "ПЕРЕВІРКА НА АКТИВНІ КОЛЛІСТИ",
+    "СТАТУС по договору",
+    "Кол-во договоров по клиенту",
+    "РНОКПП фізичної особи",
+    "ПІБ/ Найменування Боржника",
+    "Общая сумма задолженности",
+    "КАТЕГОРИЯ",
+    "Сума по акції ФІНАЛ",
+    "Общая сумма списания",
+    "Контрагент 1",
+    "Номер договора 1",
+    "Дата оформления кредита 1",
+    "Тело кредита 1",
+    "Дата реестра 1",
+    "Контрагент 2",
+    "Номер договора 2",
+    "Дата оформления кредита 2",
+    "Тело кредита 2",
+    "Дата реестра 2",
+]
+
+if work_sheet is None:
+    work_sheet = "В роботу"
+    df_work = pd.DataFrame(columns=WORK_COLUMNS)
+else:
+    df_work = sheets[work_sheet].copy()
+    df_work.columns = df_work.columns.str.strip()
+# если лист существовал — используем его шапку
+FINAL_COLUMNS = list(df_work.columns)
+
+# гарантируем наличие колонки УБКІ
+if ubki_sheet is not None:
+    if "Часть запроса УБКИ" not in FINAL_COLUMNS:
+        idx = FINAL_COLUMNS.index("ПЕРЕВІРКА НА АКТИВНІ КОЛЛІСТИ")
+        FINAL_COLUMNS.insert(idx, "Часть запроса УБКИ")
+
+
+
+# ===============================
+# 6. КОЛОНКИ В ИСХОДНИКЕ
+# ===============================
+COL_IPN   = next(c for c in df_src.columns if "іпн" in norm(c))
+COL_DOG = next(c for c in df_src.columns if norm(c) == "номер кредитного договору")
+COL_PIB   = next(c for c in df_src.columns if "піб" in norm(c))
+COL_TOTAL = next(c for c in df_src.columns if "заборг" in norm(c))
+COL_BODY  = next(c for c in df_src.columns if "основ" in norm(c))
+COL_DATE  = next(c for c in df_src.columns if "дата договору" in norm(c))
+
+COL_REEST = next(c for c in df_src.columns if "реестр" in norm(c))
+COL_AKC   = next(c for c in df_src.columns if "акция финал" in norm(c))
+COL_STAT  = next(c for c in df_src.columns if "статус" in norm(c))
+
+CONTRAGENT_MAP = {
+    "сц": "Споживчий Центр",
+    "sc": "СелфиКредит",
+    "m4you": "Манифою",
+
+    "укф": "Укр Кредит Фінанс",
+    "тас": "ТАСКОМБАНК",
+}
+
+def get_contragent(reestr_value, ipn=None, pib=None):
+    if reestr_value is None or pd.isna(reestr_value):
+        print(
+            f"⚠️ Контрагент не визначений | "
+            f"ІПН={ipn} | ПІБ={pib} | Реєстр=порожнє значення"
+        )
+        return None
+
+    s = str(reestr_value).lower()
+
+    for key, name in CONTRAGENT_MAP.items():
+        if key in s:
+            return name
+
+    print(
+        f"⚠️ Контрагент не визначений | "
+        f"ІПН={ipn} | ПІБ={pib} | Реєстр={reestr_value}"
+    )
+    return None
+
+
+df_src[COL_DOG] = df_src[COL_DOG].apply(normalize_contract_value)
+
+rows = []
+
+for ipn, g in df_src.groupby(COL_IPN):
+
+    cnt = len(g)
+
+    base = {
+        "РНОКПП фізичної особи": g.iloc[0][COL_IPN],
+        "Кол-во договоров по клиенту": cnt,
+        "ПІБ/ Найменування Боржника": g.iloc[0][COL_PIB],
+        "КАТЕГОРИЯ": None
+    }
+
+    if cnt >= 3:
+        sum_total = g[COL_TOTAL].apply(lambda x: Decimal(str(x))).sum()
+        sum_akc = g[COL_AKC].apply(lambda x: Decimal(str(x))).sum()
+
+        base.update({
+            "Общая сумма задолженности": float(sum_total),
+            "Сума по акції ФІНАЛ": float(sum_akc),
+            "Общая сумма списания": float(sum_total - sum_akc),
+        })
+
+        rows.append(base)
+        continue
+
+    # ---------- ДОГОВОР 1 ----------
+    d1 = g.iloc[0]
+    total1 = Decimal(str(d1[COL_TOTAL]))
+    akc1 = Decimal(str(d1[COL_AKC]))
+
+    sum_total = total1
+    sum_akc = akc1
+
+    base.update({
+        "Контрагент 1": get_contragent(
+    d1[COL_REEST],
+    ipn=ipn,
+    pib=g.iloc[0][COL_PIB]
+),
+        "Номер договора 1": d1[COL_DOG],
+        "Дата оформления кредита 1": get_excel_text(ws_src, g.index[0], COL_DATE, df_src.columns),
+        "Тело кредита 1": float(d1[COL_BODY]),
+        "Дата реестра 1": d1[COL_REEST],
+    })
+
+    # ---------- ДОГОВОР 2 (если есть) ----------
+    if cnt == 2:
+        d2 = g.iloc[1]
+        total2 = Decimal(str(d2[COL_TOTAL]))
+        akc2 = Decimal(str(d2[COL_AKC]))
+
+        sum_total += total2
+        sum_akc += akc2
+
+        base.update({
+            "Контрагент 2": get_contragent(
+    d2[COL_REEST],
+    ipn=ipn,
+    pib=g.iloc[0][COL_PIB]
+),
+            "Номер договора 2": d2[COL_DOG],
+            "Дата оформления кредита 2": get_excel_text(ws_src, g.index[1], COL_DATE, df_src.columns),
+            "Тело кредита 2": float(d2[COL_BODY]),
+            "Дата реестра 2": d2[COL_REEST],
+        })
+
+    # ---------- ИТОГИ ПО КЛИЕНТУ ----------
+    base.update({
+        "Общая сумма задолженности": float(sum_total),
+        "Сума по акції ФІНАЛ": float(sum_akc),
+        "Общая сумма списания": float(sum_total - sum_akc),
+    })
+
+    rows.append(base)
+    continue
+df_filled = pd.DataFrame(rows)
+# --- 1. Заполняем "Часть запроса УБКІ" ---
+if ubki_sheet is not None:
+    df_filled["Часть запроса УБКИ"] = (
+        df_filled["РНОКПП фізичної особи"].astype(str).map(ubki_map)
+    )
+# --- 2. Приводим df_filled строго к колонкам листа "В роботу" ---
+df_filled = df_filled.reindex(columns=FINAL_COLUMNS)
+df_filled = df_filled.where(pd.notna(df_filled), None)
+print("Строк обработано:", len(df_filled))
+
+# ===============================
+# ЗАПОЛНЕНИЕ КОЛОНКИ "КАТЕГОРИЯ"
+# ===============================
+if category_value is not None:
+    if "КАТЕГОРИЯ" in df_filled.columns:
+        df_filled["КАТЕГОРИЯ"] = category_value
+
+
+
+
+# 2) Добавить колонку "Часть запроса УБКИ" перед
+#    "ПЕРЕВІРКА НА АКТИВНІ КОЛЛІСТИ"
+
+# ===============================
+# 8. СОХРАНЕНИЕ
+# ===============================
+
+from openpyxl import load_workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+
+wb = load_workbook(SRC_FILE)
+if work_sheet not in wb.sheetnames:
+    ws_work = wb.create_sheet(work_sheet)
+else:
+    ws_work = wb[work_sheet]
+
+# очистка значений, формат не трогаем
+for row in ws_work.iter_rows(min_row=2):
+    for cell in row:
+        cell.value = None
+for r, row in enumerate(dataframe_to_rows(df_filled, index=False, header=True), start=1):
+    for c, value in enumerate(row, start=1):
+        cell = ws_work.cell(row=r, column=c)
+
+        # пусто
+        if value is None or pd.isna(value):
+            cell.value = None
+            continue
+
+        # если это число → пишем ЧИСЛОМ
+        if isinstance(value, (int, float, Decimal)):
+            cell.value = float(value)
+            continue
+
+        # если это дата строкой (мы уже так сделали) → пишем строкой
+        s = str(value).strip()
+        if s.lower() in ("nan", "nat", "none"):
+            cell.value = None
+        else:
+            cell.value = s
+
+
+wb.save(OUT_FILE)
+print("⚠️ ПРОВЕРЬ ЗАПОЛНЕНИЕ КОЛОНОК И ВНЕШНИЙ ВИД! ")
+print("✅ ГОТОВО:", OUT_FILE)
