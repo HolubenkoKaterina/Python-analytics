@@ -1,0 +1,199 @@
+import pandas as pd
+import glob
+import os
+
+SOURCE_FOLDER = r"C:\Users\User\Desktop\19"
+OUTPUT_FILE = r"C:\Users\User\Desktop\СДР_итог.xlsx"
+
+TECH_THRESHOLD = 12
+TECH_CHECK = 5
+
+print("задание started")
+
+# ===================== LOAD =====================
+files = glob.glob(os.path.join(SOURCE_FOLDER, "*.xlsx"))
+if not files:
+    raise ValueError("No Excel files found")
+
+USE_COLS = [
+    "Day", "Номер клиента", "ИНН", "NAME",
+    "Дата и время звонка", "Длительность разговора",
+    "Результат разговора", "M_CALLRESULT", "EMPLOYEEID"
+]
+
+frames = []
+for f in files:
+    tmp = pd.read_excel(f, engine="openpyxl")
+    tmp.columns = tmp.columns.astype(str).str.strip()
+    frames.append(tmp[[c for c in USE_COLS if c in tmp.columns]])
+
+df = pd.concat(frames, ignore_index=True)
+
+# ===================== NORMALIZE =====================
+df["Номер клиента"] = pd.to_numeric(df["Номер клиента"], errors="coerce").astype("Int64")
+df["ИНН"] = pd.to_numeric(df["ИНН"], errors="coerce").astype("Int64")
+df["Длительность разговора"] = pd.to_numeric(df["Длительность разговора"], errors="coerce")
+
+for c in ["Результат разговора", "M_CALLRESULT", "EMPLOYEEID"]:
+    df[c] = df[c].astype(str).str.strip().replace({"nan": None})
+
+base = df[USE_COLS].copy()
+
+# ===================== TECH =====================
+tech_src = base[
+    base["Номер клиента"].notna() &
+    base["M_CALLRESULT"].notna()
+].copy()
+
+def tech_bucket(x):
+    if x == "Busy":
+        return "Busy"
+    if x == "General Error":
+        return "General Error"
+    return "Other"
+
+tech_src["TECH_STATUS"] = tech_src["M_CALLRESULT"].map(tech_bucket)
+
+tech_pivot = (
+    tech_src
+    .groupby(["Номер клиента", "TECH_STATUS"])
+    .size()
+    .unstack(fill_value=0)
+)
+
+for c in ["Busy", "General Error", "Other"]:
+    if c not in tech_pivot.columns:
+        tech_pivot[c] = 0
+
+tech_pivot = tech_pivot[["Busy", "General Error", "Other"]]
+
+def tech_status(row):
+    if row["Other"] > 0:
+        return None
+    if row["Busy"] >= TECH_CHECK and row["General Error"] >= TECH_CHECK:
+        return "проверить"
+    if row["Busy"] >= TECH_THRESHOLD:
+        return "Busy"
+    if row["General Error"] >= TECH_THRESHOLD:
+        return "General Error"
+    return None
+
+tech = (
+    tech_pivot
+    .assign(СТАТУС=lambda x: x.apply(tech_status, axis=1))
+    .dropna(subset=["СТАТУС"])
+    .assign(Общий_итог=lambda x: x["Busy"] + x["General Error"])
+    .reset_index()
+)[["Номер клиента", "Busy", "General Error", "Other", "Общий_итог", "СТАТУС"]]
+
+# ===================== CONTACT =====================
+def contact_status(g):
+    STATUS_MAP = {
+        "Avtootvetchik": "avtootvet",
+        "Sbros": "sbros",
+        "Perezvonit_v": "perezvonit",
+        "Obeshaet_peredat_informaciyu": "promise_info",
+        "Zakrepit_za_Sotrudnikom": "zakrep",
+        "Interesuet_RK": "interest_rk",
+        "Somnevaetsa": "doubt",
+        "Otkaz_ot_Oplati": "otkaz_oplata",
+
+        "Tretie_litso_znaet_clienta": "Знает клиента",
+        "Tretie_litso_ne_znaet_clienta": "НЕ знает клиента",
+        "Otkaz_ot_vzaimodeystviya": "ОТКАЗ от взаимодействия",
+        "Otkaz_peredat_informaciyu": "отказ передать информацию",
+
+        "Клиент военный": "клиент военный",
+    }
+
+    CRITICAL = {
+        "Знает клиента",
+        "НЕ знает клиента",
+        "ОТКАЗ от взаимодействия",
+        "отказ передать информацию",
+    }
+
+    raw = [
+        STATUS_MAP[s]
+        for s in g["Результат разговора"]
+        if s in STATUS_MAP
+    ]
+
+    statuses = set(raw)
+    inn_cnt = g["ИНН"].nunique()
+
+    # ---------- ЗАКРЕПЛЁН ЗА СОТРУДНИКОМ ----------
+    if "zakrep" in statuses:
+        return ""
+
+    # ---------- СБРОС ----------
+    if "sbros" in statuses:
+        if "отказ передать информацию" in statuses:
+            return "отказ передать информацию"
+        crit = statuses & CRITICAL
+        if crit:
+            return next(iter(crit))
+        return ""
+
+    # ---------- КРИТИЧНЫЕ + РАЗНЫЕ ИНН ----------
+    crit = statuses & CRITICAL
+    if crit and inn_cnt > 1:
+        return "спорный"
+
+    # ---------- КРИТИЧНЫЕ ----------
+    if crit:
+        return next(iter(crit))
+
+    # ---------- АВТООТВЕТ ----------
+    if statuses == {"avtootvet"}:
+        return "avtootvet"
+
+    return ""
+
+contact_src = base[
+    (base["M_CALLRESULT"] == "Answer") &
+    base["Номер клиента"].notna() &
+    base["Результат разговора"].notna()
+].copy()
+
+# твоя функция contact_status — БЕЗ ИЗМЕНЕНИЙ
+# (я её не трогаю, чтобы не сбить логику)
+
+contact = (
+    contact_src
+    .groupby("Номер клиента", sort=False)
+    .apply(contact_status, include_groups=False)
+    .reset_index(name="Контактный статус")
+)
+
+# ===================== SAVE =====================
+if os.path.exists(OUTPUT_FILE):
+    try:
+        os.remove(OUTPUT_FILE)
+    except PermissionError:
+        raise PermissionError("Output file is open. Close Excel and retry.")
+
+MAX_ROWS = 1_048_000
+
+with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+
+    # ---------- БАЗА (РАЗБИВАЕМ) ----------
+    total_rows = len(base)
+    parts = (total_rows // MAX_ROWS) + 1
+
+    for i in range(parts):
+        start = i * MAX_ROWS
+        end = min((i + 1) * MAX_ROWS, total_rows)
+        base.iloc[start:end].to_excel(
+            writer,
+            sheet_name=f"БАЗА_{i+1}",
+            index=False
+        )
+
+    # ---------- ТЕХ ----------
+    tech.to_excel(writer, sheet_name="ТЕХ", index=False)
+
+    # ---------- КОНТАКТ ----------
+    contact.to_excel(writer, sheet_name="КОНТАКТНЫЕ_СТАТУСЫ", index=False)
+
+print("задание finished")
