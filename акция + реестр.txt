@@ -1,0 +1,717 @@
+import pandas as pd
+import os
+from decimal import Decimal
+import warnings
+import re
+import shutil
+from openpyxl import load_workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# ========== =====================
+# 1. ПУТИ
+# ===============================
+SOURCE_FILE = r"C:\Users\User\Desktop\Лист Microsoft Excel.xlsx"
+SPRAV_FILE  = r"C:\Users\User\Desktop\СПРАВОЧНИК для аутсорса (ТАС, УКФ).xlsx"
+
+DESKTOP = os.path.join(os.path.expanduser("~"), "Desktop")
+src_name = os.path.splitext(os.path.basename(SOURCE_FILE))[0]
+OUT_FILE = os.path.join(DESKTOP, f"{src_name} АКЦИЯ+ РЕЕСТР.xlsx")
+
+print("ЗАПУСК")
+# ===============================
+# 2. ВСПОМОГАТЕЛЬНЫЕ
+# ===============================
+def write_df_preserve_format(ws, df):
+    """
+    Записывает значения ТОЛЬКО в существующие колонки Excel.
+    Старое форматирование сохраняется.
+    Новые колонки (которых нет в Excel) НЕ трогает.
+    """
+    # карта заголовков Excel
+    header_map = {
+        str(cell.value).strip(): idx + 1
+        for idx, cell in enumerate(ws[1])
+        if cell.value is not None
+    }
+
+    # чистим ТОЛЬКО существующие колонки
+    for col_name, col_idx in header_map.items():
+        if col_name not in df.columns:
+            continue
+        for row in ws.iter_rows(min_row=2, min_col=col_idx, max_col=col_idx):
+            row[0].value = None
+
+    # пишем данные ТОЛЬКО в совпадающие заголовки
+    for r_idx, (_, row) in enumerate(df.iterrows(), start=2):
+        for col_name, value in row.items():
+            if col_name not in header_map:
+                # новая колонка — пропускаем (будет без формата)
+                continue
+            ws.cell(row=r_idx, column=header_map[col_name]).value = (
+                None if pd.isna(value) else value
+            )
+def remove_excel_tables(ws):
+    """
+    Полностью удаляет Excel-таблицы (ListObject) с листа,
+    превращая их в обычный диапазон.
+    Формулы, данные, форматирование сохраняются.
+    """
+    if hasattr(ws, "tables") and ws.tables:
+        ws.tables.clear()
+
+def normalize_dog_key(s: pd.Series) -> pd.Series:
+    return (
+        s.astype(str)
+        .str.replace("\u200b", "", regex=False)
+        .str.replace("\xa0", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace("–", "-", regex=False)
+        .str.replace("—", "-", regex=False)
+        .str.strip()
+    )
+def normalize_ipn_key(s: pd.Series) -> pd.Series:
+    return (
+        s.astype(str)
+        .str.replace("\u200b", "", regex=False)
+        .str.replace("\xa0", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace(".0", "", regex=False)
+        .str.strip()
+    )
+def clean_header(x):
+    return (
+        str(x)
+        .replace("\u200b", "")
+        .replace("\xa0", " ")
+        .replace("\n", " ")
+        .replace("\r", " ")
+        .strip()
+        .replace("  ", " ")
+    )
+from openpyxl.utils import get_column_letter
+import re
+
+def _a1_to_coords(a1: str):
+    # "A1" -> ("A", 1)
+    m = re.match(r"^([A-Z]+)(\d+)$", a1)
+    return m.group(1), int(m.group(2))
+
+def _range_to_bounds(rng: str):
+    # "A1:K20" -> (min_col, min_row, max_col, max_row)
+    left, right = rng.split(":")
+    c1, r1 = _a1_to_coords(left)
+    c2, r2 = _a1_to_coords(right)
+
+    def col_to_int(col_letters: str) -> int:
+        n = 0
+        for ch in col_letters:
+            n = n * 26 + (ord(ch) - 64)
+        return n
+
+    return col_to_int(c1), r1, col_to_int(c2), r2
+
+def _bounds_to_range(min_col, min_row, max_col, max_row):
+    return f"{get_column_letter(min_col)}{min_row}:{get_column_letter(max_col)}{max_row}"
+
+def _extend_tables_after_insert(ws, insert_at_col: int, inserted_cols: int):
+    """
+    Обновляет диапазоны Excel-таблиц на листе, если вставка колонок попала внутрь таблицы.
+    """
+    # ws.tables может быть dict-like
+    tables = getattr(ws, "tables", None)
+    if not tables:
+        return
+
+    for name, tbl in ws.tables.items():
+        min_c, min_r, max_c, max_r = _range_to_bounds(tbl.ref)
+
+        # если вставка произошла внутри таблицы (или на ее границе слева)
+        # то правую границу таблицы надо сдвинуть вправо
+        if insert_at_col <= max_c:
+            max_c += inserted_cols
+            new_ref = _bounds_to_range(min_c, min_r, max_c, max_r)
+            tbl.ref = new_ref
+
+            # автофильтр тоже обновим (если есть)
+            if getattr(tbl, "autoFilter", None) is not None and getattr(tbl.autoFilter, "ref", None):
+                # автофильтр обычно равен ref без заголовков/или совпадает — безопасно выставить как ref
+                tbl.autoFilter.ref = new_ref
+
+def ensure_calc_columns_after_count(ws, calc_cols, after_col_name):
+    """
+    Вставляет расчетные колонки сразу после after_col_name.
+    И ВАЖНО: если на листе есть Excel-таблица (ListObject),
+    расширяет её диапазон, чтобы Excel не показывал 'восстановление'.
+    """
+    headers = [cell.value for cell in ws[1]]
+
+    if after_col_name not in headers:
+        raise ValueError(f"❌ Колонка '{after_col_name}' не найдена в Excel")
+
+    insert_pos = headers.index(after_col_name) + 2  # 1-based, сразу после after_col_name
+
+    inserted_total = 0
+    for col in calc_cols:
+        # актуализируем заголовки после каждой вставки
+        headers_now = [cell.value for cell in ws[1]]
+        if col in headers_now:
+            continue
+
+        ws.insert_cols(insert_pos)
+        _extend_tables_after_insert(ws, insert_pos, 1)
+
+        ws.cell(row=1, column=insert_pos).value = col
+        insert_pos += 1
+        inserted_total += 1
+
+def write_df_by_headers(ws, df):
+    header_map = {
+        clean_header(cell.value): i + 1
+        for i, cell in enumerate(ws[1])
+        if cell.value is not None
+    }
+
+    # ❗ ЧИСТИМ ТОЛЬКО КОЛОНКИ, КОТОРЫЕ БУДЕМ ПИСАТЬ
+    for col_name, col_idx in header_map.items():
+        if col_name not in df.columns:
+            continue
+        for row in ws.iter_rows(min_row=2, min_col=col_idx, max_col=col_idx):
+            row[0].value = None
+
+    # ✍️ ПИШЕМ ЗНАЧЕНИЯ
+    for r_idx, (_, row) in enumerate(df.iterrows(), start=2):
+        for col_name, value in row.items():
+            col_name_clean = clean_header(col_name)
+            if col_name_clean not in header_map:
+                continue
+            ws.cell(
+                row=r_idx,
+                column=header_map[col_name_clean]
+            ).value = None if pd.isna(value) else value
+
+
+def norm(x):
+    return str(x).strip().lower().replace("\xa0", " ")
+
+def find_col(cols, keywords):
+    for c in cols:
+        if all(k in norm(c) for k in keywords):
+            return c
+    raise ValueError(f"❌ Не найдена колонка: {keywords}")
+
+
+def safe_to_numeric(series):
+    try:
+        return pd.to_numeric(series)
+    except:
+        return series
+
+def to_decimal(x):
+    if pd.isna(x):
+        return Decimal("0")
+    s = str(x).replace("\xa0", "").replace(" ", "").replace(",", ".")
+    try:
+        return Decimal(s)
+    except:
+        return Decimal("0")
+
+def normalize_number_like_text(s: pd.Series) -> pd.Series:
+    return (
+        s.astype(str)
+        .str.replace("\xa0", " ", regex=False)
+        .str.strip()
+        .str.replace(r"\.0$", "", regex=True)
+    )
+
+def detect_factoring_name(x):
+    if pd.isna(x):
+        return "Споживчий центр"
+
+    s = str(x).upper()
+
+    if "УКФ" in s:
+        return "Укр Кредит Фінанс"
+    if "МФЮ" in s:
+        return "Маніфою"
+    if "НІ" in s:
+        return "ТАСКОМБАНК"
+    if "SC" in s:
+        return "СелфіКредіт"
+
+    return "Споживчий центр"
+
+# ===============================
+# 🔒 ДАТЫ: СТРОГОЕ ПРИВЕДЕНИЕ К dd.mm.yyyy БЕЗ ПЕРЕПУТЫВАНИЙ
+# ===============================
+_re_iso = re.compile(r"^\s*(\d{4})-(\d{2})-(\d{2})(?:\s+\d{1,2}:\d{2}(:\d{2})?)?\s*$")
+_re_dmy = re.compile(r"^\s*(\d{2})\.(\d{2})\.(\d{4})(?:\s+\d{1,2}:\d{2}(:\d{2})?)?\s*$")
+
+def normalize_date_str(x) -> str | None:
+    if x is None or pd.isna(x):
+        return None
+    s = str(x).strip()
+    if s == "" or s.lower() in ("nan", "none"):
+        return None
+
+    # 1) ISO: YYYY-MM-DD [time] -> DD.MM.YYYY
+    m = _re_iso.match(s)
+    if m:
+        yyyy, mm, dd = m.group(1), m.group(2), m.group(3)
+        return f"{dd}.{mm}.{yyyy}"
+
+    # 2) DMY: DD.MM.YYYY [time] -> DD.MM.YYYY
+    m = _re_dmy.match(s)
+    if m:
+        dd, mm, yyyy = m.group(1), m.group(2), m.group(3)
+        return f"{dd}.{mm}.{yyyy}"
+
+    # 3) иначе не трогаем (чтобы не сломать нестандарт)
+    return s
+
+def normalize_date_cols(df: pd.DataFrame) -> pd.DataFrame:
+    date_cols = [c for c in df.columns if "дата" in norm(c)]
+    for c in date_cols:
+        df[c] = df[c].apply(normalize_date_str)
+    return df
+
+# ===============================
+# 3. ЗАГРУЗКА ФАЙЛА
+# ===============================
+xls = pd.ExcelFile(SOURCE_FILE)
+
+SRC_SHEET = next((s for s in xls.sheet_names if "исходник" in norm(s)), None)
+if SRC_SHEET is None:
+    raise ValueError("❌ Не найден лист Исходник")
+
+all_sheets = {
+    s: pd.read_excel(SOURCE_FILE, sheet_name=s, dtype=str)
+    for s in xls.sheet_names
+}
+
+# ===============================
+# 4. ИСХОДНИК
+# ===============================
+df_src = all_sheets[SRC_SHEET].copy()
+df_src.columns = df_src.columns.str.strip()
+SRC_COLS_ORIGINAL = list(df_src.columns)
+
+# нормализуем даты в исходнике
+df_src = normalize_date_cols(df_src)
+
+TEXT_KEYWORDS = [
+    "піб", "фио", "прізвище", "імя", "ім'я",
+    "по батькові", "назва", "клієнт", "клиент"
+]
+
+# чистим числа, но даты/текст не трогаем
+ID_KEYWORDS = ["договор", "догов", "номер", "іпн", "инн", "рнокпп", "ідн"]
+for c in df_src.columns:
+    c_norm = norm(c)
+
+    if "дата" in c_norm:
+        continue
+    if any(k in c_norm for k in TEXT_KEYWORDS):
+        continue
+    if any(k in c_norm for k in ID_KEYWORDS):
+        continue   # ⬅️ ВОТ ЭТОГО НЕ ХВАТАЛО
+
+    df_src[c] = safe_to_numeric(
+        df_src[c].astype(str)
+        .str.replace("\xa0", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+
+# ===============================
+# 5. СПРАВОЧНИКИ
+# ===============================
+ukf = pd.read_excel(SPRAV_FILE, sheet_name=0, dtype=str)
+tas = pd.read_excel(SPRAV_FILE, sheet_name=1, dtype=str)
+
+ukf.columns = ukf.columns.str.strip()
+tas.columns = tas.columns.str.strip()
+
+# ===============================
+# 6. КОЛОНКИ
+# ===============================
+COL_TOTAL  = find_col(df_src.columns, ["заборг"])
+COL_BODY   = find_col(df_src.columns, ["основ"])
+COL_DOG    = find_col(df_src.columns, ["номер", "договор"])
+COL_REESTR = find_col(df_src.columns, ["реестр"])
+COL_COUNT  = find_col(df_src.columns, ["кількість", "договор"])
+COL_IPN    = find_col(df_src.columns, ["іпн"])
+
+df_src[COL_DOG] = normalize_number_like_text(df_src[COL_DOG])
+df_src[COL_IPN] = normalize_number_like_text(df_src[COL_IPN])
+
+UKF_DOG = find_col(ukf.columns, ["договор"])
+UKF_SUM = find_col(ukf.columns, ["акц"])
+TAS_DOG = find_col(tas.columns, ["договор"])
+TAS_SUM = find_col(tas.columns, ["акц"])
+
+# ===============================
+# 7. РАСЧЕТ
+# ===============================
+df_calc = df_src.copy()
+df_calc["_DOG_KEY"] = normalize_dog_key(df_calc[COL_DOG])
+df_calc["_body"]  = df_calc[COL_BODY].apply(to_decimal)
+df_calc["_total"] = df_calc[COL_TOTAL].apply(to_decimal)
+
+df_calc["Соотношение общего долга к телу"] = df_calc.apply(
+    lambda r: float(r["_total"] / r["_body"]) if r["_body"] != 0 else None,
+    axis=1
+)
+
+def category(reg, r):
+    if str(reg).strip() in ("УКФ-261224", "ТАС-061224"):
+        return "не расчитывать"
+    if r is None or pd.isna(r):
+        return "проверить"
+    if r < 1.2: return "тело"
+    if r < 1.5: return "тело +10%"
+    if r < 1.8: return "тело +20%"
+    if r < 2.1: return "тело +30%"
+    if r < 2.4: return "тело +40%"
+    if r < 2.7: return "тело +50%"
+    if r < 3.0: return "тело +60%"
+    if r < 3.3: return "тело +70%"
+    if r < 3.7: return "тело +80%"
+    return "тело +90%"
+
+df_calc["категория"] = df_calc.apply(
+    lambda x: category(x[COL_REESTR], x["Соотношение общего долга к телу"]),
+    axis=1
+)
+
+ukf_map = ukf.set_index(normalize_number_like_text(ukf[UKF_DOG]))[UKF_SUM].to_dict()
+tas_map = tas.set_index(normalize_number_like_text(tas[TAS_DOG]))[TAS_SUM].to_dict()
+
+COEF = {
+    "тело":1,"тело +10%":1.1,"тело +20%":1.2,"тело +30%":1.3,
+    "тело +40%":1.4,"тело +50%":1.5,"тело +60%":1.6,
+    "тело +70%":1.7,"тело +80%":1.8,"тело +90%":1.9
+}
+
+def calc_action(r):
+    cat = r["категория"]
+    dog = r["_DOG_KEY"]
+
+    if cat == "не расчитывать":
+        v = ukf_map.get(dog)
+        if v is None or str(v).strip() == "":
+            v = tas_map.get(dog)
+        try:
+            return int(str(v).replace(" ", "").replace("\xa0", "").replace(",", ".")) if v is not None else None
+        except:
+            return None
+
+    if cat == "проверить":
+        return None
+
+    return int(r["_body"] * Decimal(str(COEF[cat])))
+
+
+df_calc["Акция"] = df_calc.apply(calc_action, axis=1)
+df_calc["АКЦИЯ ФИНАЛ"] = df_calc["Акция"].apply(lambda x: (x // 10) * 10 if isinstance(x, int) else None)
+
+df_calc["проверка"] = df_calc.apply(
+    lambda x: x["АКЦИЯ ФИНАЛ"] - int(x["_body"]) if pd.notna(x["АКЦИЯ ФИНАЛ"]) else None,
+    axis=1
+)
+df_calc["проверка общего долга"] = df_calc.apply(
+    lambda x: x["АКЦИЯ ФИНАЛ"] - int(x["_total"]) if pd.notna(x["АКЦИЯ ФИНАЛ"]) else None,
+    axis=1
+)
+# ===============================
+# 🚨 ПРОВЕРКА КОРРЕКТНОСТИ РАСЧЁТА АКЦИИ
+# УСЛОВИЯ:
+# 1) проверка <= -2000  → ПРОВЕРИТЬ
+#    (-2000 плохо, -1900 ок)
+# 2) проверка общего долга > 0 → ПРОВЕРИТЬ
+# ИНАЧЕ → ВСЕ ОК
+# ===============================
+
+mask_bad = (
+    (df_calc["проверка"].notna() & (df_calc["проверка"] <= -2000)) |
+    (df_calc["проверка общего долга"].notna() & (df_calc["проверка общего долга"] > 0))
+)
+
+if mask_bad.any():
+    print("\n🚨 ОБНАРУЖЕНЫ ПРОБЛЕМЫ В РАСЧЁТЕ АКЦИИ:")
+
+    bad_rows = df_calc.loc[
+        mask_bad,
+        [COL_IPN, COL_DOG, "проверка", "проверка общего долга"]
+    ]
+
+    for _, r in bad_rows.iterrows():
+        ipn = str(r[COL_IPN]).strip()
+        dog = r["_DOG_KEY"]
+        chk = r["проверка"]
+        chk_total = r["проверка общего долга"]
+
+        print(
+            f"❗ ПРОВЕРИТЬ РАСЧЕТ АКЦИИ | "
+            f"ІПН {ipn} | ДОГОВОР {dog} | "
+            f"проверка={chk} | проверка общего долга={chk_total}"
+        )
+else:
+    print("\n✅ РАСЧЁТ АКЦИИ ПРОШЁЛ ПРОВЕРКУ — ВСЕ ОК")
+
+# ===============================
+# 9. МАППИНГИ ДЛЯ РЕЕСТРА (ИЗ ИСХОДНИКА!)
+# ===============================
+
+# ключ договора
+
+
+
+# --- 1) ІПН → кількість договорів
+# --- 1) ІПН → кількість договорів (ТОЛЬКО ЧИСЛО)
+df_calc["_IPN_KEY"] = normalize_ipn_key(df_calc[COL_IPN])
+
+
+
+contracts_by_ipn = (
+    df_calc
+    .dropna(subset=["_IPN_KEY", "_DOG_KEY"])
+    .groupby("_IPN_KEY")["_DOG_KEY"]
+    .nunique()
+    .to_dict()
+)
+
+
+# --- 2) Договор → АКЦИЯ ФИНАЛ
+akc_by_dog = (
+    df_calc
+    .set_index("_DOG_KEY")["АКЦИЯ ФИНАЛ"]
+    .to_dict()
+)
+
+# --- 3) Договор → первинний кредитор
+contragent_by_dog = (
+    df_calc
+    .dropna(subset=["_DOG_KEY", COL_REESTR])
+    .assign(_CONTR=lambda x: x[COL_REESTR].apply(detect_factoring_name))
+    .set_index("_DOG_KEY")["_CONTR"]
+    .to_dict()
+)
+
+# ===============================
+# 8. ФИНАЛЬНЫЙ ИСХОДНИК
+# ===============================
+df_out = df_src[SRC_COLS_ORIGINAL].copy()
+
+calc_cols = [
+    "Соотношение общего долга к телу",
+    "категория",
+    "Акция",
+    "АКЦИЯ ФИНАЛ",
+    "проверка",
+    "проверка общего долга"
+]
+
+for c in calc_cols:
+    df_out[c] = df_calc[c]
+
+insert_pos = df_out.columns.get_loc(COL_COUNT) + 1
+for c in reversed(calc_cols):
+    df_out.insert(insert_pos, c, df_out.pop(c))
+# ===============================
+# 10. ОБРАБОТКА ЛИСТА "РЕЕСТР" (ЕСЛИ ЕСТЬ)
+# ===============================
+
+reestr_sheet = next((s for s in all_sheets if "реестр" in norm(s)), None)
+
+if reestr_sheet:
+    df_reestr = all_sheets[reestr_sheet].copy()
+    df_reestr.columns = df_reestr.columns.str.strip()
+    df_reestr = df_reestr.loc[:, ~df_reestr.columns.duplicated()]
+
+    # 🔒 Реестр: даты ТОЛЬКО строками, без времени
+    for col in df_reestr.columns:
+        if "дата" in norm(col):
+            df_reestr[col] = df_reestr[col].apply(normalize_date_str)
+    # --- находим колонки
+    REESTR_IPN = next(
+        (
+            c for c in df_reestr.columns
+            if "рнокпп" in norm(c)
+        ),
+        None
+    )
+
+    if REESTR_IPN is None:
+        raise ValueError("❌ В листе Реестр не найдена колонка 'РНОКПП Споживача'")
+
+    if REESTR_IPN is None:
+        raise ValueError("❌ В листе Реестр не найдена колонка ІПН / РНОКПП")
+    REESTR_DOG = next(
+        c for c in df_reestr.columns
+        if "договор" in norm(c) and "кільк" not in norm(c)
+    )
+    FACTOR_CONTRACT_COL = next(
+        c for c in df_reestr.columns
+        if "договору факторингу" in norm(c)
+    )
+    # нормализуем ключи
+    df_reestr[REESTR_IPN] = normalize_number_like_text(df_reestr[REESTR_IPN])
+    df_reestr[REESTR_DOG] = normalize_number_like_text(df_reestr[REESTR_DOG])
+    df_reestr["_DOG_KEY"] = normalize_dog_key(df_reestr[REESTR_DOG])
+
+
+
+    # --- 1) Кількість договорів по ІПН
+    CNT_COL = "Кількість договорів по 1-му клієнту (ІПН)"
+    if CNT_COL not in df_reestr.columns:
+        df_reestr.insert(0, CNT_COL, None)
+
+    df_reestr["_IPN_KEY"] = normalize_ipn_key(df_reestr[REESTR_IPN])
+
+    df_reestr[CNT_COL] = df_reestr["_IPN_KEY"].map(contracts_by_ipn)
+    # ===============================
+    # 🔍 ПРОВЕРКА СОВПАДЕНИЯ ІПН: ИСХОДНИК vs РЕЕСТР
+    # ===============================
+
+    src_ipn_set = set(
+        df_calc["_IPN_KEY"]
+        .dropna()
+        .unique()
+    )
+
+    reestr_ipn_set = set(
+        df_reestr["_IPN_KEY"]
+        .dropna()
+        .unique()
+    )
+
+    src_cnt = len(src_ipn_set)
+    reestr_cnt = len(reestr_ipn_set)
+
+    print("\n🔎 ПРОВЕРКА ІПН:")
+    print(f"Исходник: {src_cnt} унікальних ІПН")
+    print(f"Реестр:   {reestr_cnt} унікальних ІПН")
+
+    if src_cnt == reestr_cnt:
+
+
+        print("✅ КОЛИЧЕСТВО ІПН СОВПАДАЕТ")
+    else:
+        print("❌ НЕСОВПАДЕНИЕ КОЛИЧЕСТВА ІПН")
+
+        only_in_src = src_ipn_set - reestr_ipn_set
+        only_in_reestr = reestr_ipn_set - src_ipn_set
+
+        if only_in_src:
+            print(f"⚠️ Є в ИСХОДНИКЕ, але немає в РЕЕСТРЕ ({len(only_in_src)}):")
+            for ipn in list(only_in_src)[:20]:
+                print("   ", ipn)
+
+        if only_in_reestr:
+            print(f"⚠️ Є в РЕЕСТРЕ, але немає в ИСХОДНИКЕ ({len(only_in_reestr)}):")
+            for ipn in list(only_in_reestr)[:20]:
+                print("   ", ipn)
+
+    # --- 2) К оплате по акции
+    # --- 2) К оплате по акции
+    PAY_COL = "К оплате по акции"
+    if PAY_COL not in df_reestr.columns:
+        df_reestr[PAY_COL] = None
+
+    mapped = df_reestr["_DOG_KEY"].map(akc_by_dog)
+    df_reestr[PAY_COL] = mapped.where(mapped.notna(), df_reestr[PAY_COL])
+
+
+
+
+    # --- 3) Первинний кредитор
+    CONTR_COL = "Первинний кредитор"
+    if CONTR_COL not in df_reestr.columns:
+        df_reestr[CONTR_COL] = None
+
+    CONTR_COL = "Первинний кредитор"
+    if CONTR_COL not in df_reestr.columns:
+        df_reestr[CONTR_COL] = None
+
+    df_reestr[CONTR_COL] = (
+        df_reestr[FACTOR_CONTRACT_COL]
+        .apply(detect_factoring_name)
+    )
+    # --- ПЕРЕМЕЩАЕМ "Первинний кредитор" ПОСЛЕ "Дата договору факторингу"
+    FACTOR_DATE_COL = next(
+        c for c in df_reestr.columns
+        if "дата договору факторингу" in norm(c)
+    )
+
+    cols = list(df_reestr.columns)
+
+    # убираем колонку из конца
+    cols.remove(CONTR_COL)
+
+    # вставляем сразу после даты факторинга
+    insert_pos = cols.index(FACTOR_DATE_COL) + 1
+    cols.insert(insert_pos, CONTR_COL)
+
+    df_reestr = df_reestr[cols]
+
+    all_sheets[reestr_sheet] = df_reestr
+
+## ===============================
+# 10. СОХРАНЕНИЕ
+# ===============================
+
+# 1️⃣ создаём копию исходника
+shutil.copy(SOURCE_FILE, OUT_FILE)
+
+# 2️⃣ открываем копию
+wb = load_workbook(OUT_FILE)
+ws_src = wb[SRC_SHEET]
+
+# 🔴 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ
+remove_excel_tables(ws_src)
+
+# 3️⃣ ВСТАВЛЯЕМ РАСЧЁТНЫЕ КОЛОНКИ (ОДИН РАЗ!)
+ensure_calc_columns_after_count(
+    ws_src,
+    calc_cols,
+    after_col_name=COL_COUNT
+)
+
+# 4️⃣ ПИШЕМ ДАННЫЕ В ИСХОДНИК
+write_df_preserve_format(ws_src, df_out)
+
+# 5️⃣ ПИШЕМ РЕЕСТР
+if reestr_sheet:
+    ws_reestr = wb[reestr_sheet]
+    df_reestr.columns = [clean_header(c) for c in df_reestr.columns]
+    write_df_by_headers(ws_reestr, df_reestr)
+
+# 6️⃣ СОХРАНЯЕМ И ЗАКРЫВАЕМ
+wb.save(OUT_FILE)
+wb.close()
+print(
+    "\n🔎 ПРОВЕРКА РЕЕСТРОВ:\n"
+    "Проверь, появились ли новые реестры после последнего расчета.\n"
+    "Если в работу добавлены новые реестры или изменился их формат,\n"
+    "скрипт необходимо ДОРАБОТАТЬ под новые данные.\n\n"
+    "Текущий расчет корректен только для реестров,\n"
+    "которые были учтены на момент написания скрипта."
+)
+print(
+    "\n⚠️ ВАЖНО:\n"
+    "Если при открытии обработанного файла Excel показывает сообщение\n"
+    "«Обнаружены проблемы с содержимым» или предлагает восстановление файла,\n"
+    "это означает, что исходный файл имеет поврежденную внутреннюю структуру.\n\n"
+    "В этом случае необходимо:\n"
+    "1) Открыть исходный файл\n"
+    "2) Скопировать данные каждого листа\n"
+    "3) Вставить их в НОВЫЙ файл Excel через «Специальная вставка → Значения и форматы»\n"
+    "4) Сохранить названия листов без изменений\n"
+    "5) Использовать заново созданный файл как исходник для расчета\n\n"
+    "Обычное «Сохранить как» проблему не решает."
+)
+
+print("ГОТОВО:", OUT_FILE)
+
+
