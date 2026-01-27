@@ -1,0 +1,390 @@
+import pandas as pd
+import os
+from decimal import Decimal
+import warnings
+import re
+from openpyxl import load_workbook
+import shutil
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# ===============================
+# 1. ПУТИ
+# ===============================
+SOURCE_FILE = r"C:\Users\User\Desktop\МИКС 21 в работу 14.01.xlsx"
+SPRAV_FILE  = r"C:\Users\User\Desktop\СПРАВОЧНИК для аутсорса (ТАС, УКФ).xlsx"
+
+DESKTOP = os.path.join(os.path.expanduser("~"), "Desktop")
+src_name = os.path.splitext(os.path.basename(SOURCE_FILE))[0]
+OUT_FILE = os.path.join(DESKTOP, f"{src_name}_АКЦИЯ.xlsx")
+
+print("▶️ ЗАПУСК")
+
+# ===============================
+# 2. ВСПОМОГАТЕЛЬНЫЕ
+# ===============================
+def smart_ipn(x):
+    if pd.isna(x):
+        return None
+
+    s = str(x).strip()
+
+    # если только цифры → int
+    if re.fullmatch(r"\d+", s):
+        try:
+            return int(s)
+        except:
+            return s
+
+    # всё остальное оставляем строкой
+    return s
+def norm(x):
+    return str(x).strip().lower().replace("\xa0", " ")
+
+def find_col(cols, keywords):
+    for c in cols:
+        if all(k in norm(c) for k in keywords):
+            return c
+    raise ValueError(f"❌ Не найдена колонка: {keywords}")
+
+def safe_to_numeric(series):
+    try:
+        return pd.to_numeric(series)
+    except:
+        return series
+
+def to_decimal(x):
+    if pd.isna(x):
+        return Decimal("0")
+    s = str(x).replace("\xa0", "").replace(" ", "").replace(",", ".")
+    try:
+        return Decimal(s)
+    except:
+        return Decimal("0")
+
+def normalize_number_like_text(s: pd.Series) -> pd.Series:
+    return (
+        s.astype(str)
+        .str.replace("\xa0", " ", regex=False)
+        .str.strip()
+        .str.replace(r"\.0$", "", regex=True)
+    )
+def smart_contract_number(x):
+    if pd.isna(x):
+        return None
+
+    s = str(x).strip()
+
+    # если только цифры — делаем числом
+    if re.fullmatch(r"\d+", s):
+        try:
+            return int(s)
+        except:
+            return s
+
+    # всё остальное оставляем строкой
+    return s
+def detect_factoring_name(x):
+    if pd.isna(x):
+        return "Споживчий центр"
+    s = str(x).upper()
+    if "УКФ" in s:
+        return "Укр Кредит Фінанс"
+    if "МФЮ" in s:
+        return "Маніфою"
+    if "НІ" in s:
+        return "ТАСКОМБАНК"
+    return "Споживчий центр"
+
+# ===============================
+# 🔒 ДАТЫ: СТРОГОЕ ПРИВЕДЕНИЕ К dd.mm.yyyy БЕЗ ПЕРЕПУТЫВАНИЙ
+# ===============================
+_re_iso = re.compile(r"^\s*(\d{4})-(\d{2})-(\d{2})(?:\s+\d{1,2}:\d{2}(:\d{2})?)?\s*$")
+_re_dmy = re.compile(r"^\s*(\d{2})\.(\d{2})\.(\d{4})(?:\s+\d{1,2}:\d{2}(:\d{2})?)?\s*$")
+
+def normalize_date_str(x) -> str | None:
+    if x is None or pd.isna(x):
+        return None
+    s = str(x).strip()
+    if s == "" or s.lower() in ("nan", "none"):
+        return None
+
+    # 1) ISO: YYYY-MM-DD [time] -> DD.MM.YYYY
+    m = _re_iso.match(s)
+    if m:
+        yyyy, mm, dd = m.group(1), m.group(2), m.group(3)
+        return f"{dd}.{mm}.{yyyy}"
+
+    # 2) DMY: DD.MM.YYYY [time] -> DD.MM.YYYY
+    m = _re_dmy.match(s)
+    if m:
+        dd, mm, yyyy = m.group(1), m.group(2), m.group(3)
+        return f"{dd}.{mm}.{yyyy}"
+
+    # 3) иначе не трогаем (чтобы не сломать нестандарт)
+    return s
+
+def normalize_date_cols(df: pd.DataFrame) -> pd.DataFrame:
+    date_cols = [c for c in df.columns if "дата" in norm(c)]
+    for c in date_cols:
+        df[c] = df[c].apply(normalize_date_str)
+    return df
+
+# ===============================
+# 3. ЗАГРУЗКА ФАЙЛА
+# ===============================
+xls = pd.ExcelFile(SOURCE_FILE)
+
+SRC_SHEET = next((s for s in xls.sheet_names if "исходник" in norm(s)), None)
+if SRC_SHEET is None:
+    raise ValueError("❌ Не найден лист Исходник")
+
+all_sheets = {
+    s: pd.read_excel(SOURCE_FILE, sheet_name=s, dtype=str)
+    for s in xls.sheet_names
+}
+
+# ===============================
+# 4. ИСХОДНИК
+# ===============================
+df_src = all_sheets[SRC_SHEET].copy()
+df_src.columns = df_src.columns.str.strip()
+SRC_COLS_ORIGINAL = list(df_src.columns)
+
+# нормализуем даты в исходнике
+df_src = normalize_date_cols(df_src)
+
+TEXT_KEYWORDS = [
+    "піб", "фио", "прізвище", "імя", "ім'я",
+    "по батькові", "назва", "клієнт", "клиент"
+]
+
+# чистим числа, но даты/текст не трогаем
+for c in df_src.columns:
+    c_norm = norm(c)
+    if "дата" in c_norm:
+        continue
+    if any(k in c_norm for k in TEXT_KEYWORDS):
+        continue
+
+    df_src[c] = safe_to_numeric(
+        df_src[c].astype(str)
+        .str.replace("\xa0", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+
+# ===============================
+# 5. СПРАВОЧНИКИ
+# ===============================
+ukf = pd.read_excel(SPRAV_FILE, sheet_name=0, dtype=str)
+tas = pd.read_excel(SPRAV_FILE, sheet_name=1, dtype=str)
+
+ukf.columns = ukf.columns.str.strip()
+tas.columns = tas.columns.str.strip()
+
+# ===============================
+# 6. КОЛОНКИ
+# ===============================
+COL_TOTAL  = find_col(df_src.columns, ["заборг"])
+COL_BODY   = find_col(df_src.columns, ["основ"])
+COL_DOG    = find_col(df_src.columns, ["номер", "договор"])
+COL_REESTR = find_col(df_src.columns, ["реестр"])
+COL_COUNT  = find_col(df_src.columns, ["кількість", "договор"])
+COL_IPN    = find_col(df_src.columns, ["іпн"])
+
+df_src[COL_DOG] = df_src[COL_DOG].apply(smart_contract_number)
+df_src[COL_IPN] = df_src[COL_IPN].apply(smart_ipn)
+
+UKF_DOG = find_col(ukf.columns, ["договор"])
+UKF_SUM = find_col(ukf.columns, ["акц"])
+TAS_DOG = find_col(tas.columns, ["договор"])
+TAS_SUM = find_col(tas.columns, ["акц"])
+
+# ===============================
+# 7. РАСЧЕТ
+# ===============================
+df_calc = df_src.copy()
+
+df_calc["_body"]  = df_calc[COL_BODY].apply(to_decimal)
+df_calc["_total"] = df_calc[COL_TOTAL].apply(to_decimal)
+
+# ✅ ПРОВЕРКА НУЛЕЙ (долг или тело = 0)
+# ===============================
+mask_zero = (df_calc["_total"] == 0) | (df_calc["_body"] == 0)
+
+if mask_zero.any():
+    bad = df_calc.loc[mask_zero, [COL_IPN, COL_DOG, COL_TOTAL, COL_BODY, "_total", "_body"]].copy()
+
+    print("\n⚠️ НАЙДЕНЫ СТРОКИ С НУЛЕВЫМИ СУММАМИ (нужно проверить):")
+    for _, row in bad.iterrows():
+        ipn = str(row.get(COL_IPN, "")).strip()
+        dog = str(row.get(COL_DOG, "")).strip()
+        total_raw = row.get(COL_TOTAL, "")
+        body_raw = row.get(COL_BODY, "")
+        print(f"ПРОВЕРИТЬ ИНН {ipn} | ДОГОВОР {dog} | TOTAL={total_raw} | BODY={body_raw}")
+df_calc["Соотношение общего долга к телу"] = df_calc.apply(
+    lambda r: float(r["_total"] / r["_body"]) if r["_body"] != 0 else None,
+    axis=1
+)
+
+def category(reg, r):
+    if str(reg).strip() in ("УКФ-261224", "ТАС-061224"):
+        return "не расчитывать"
+    if r is None or pd.isna(r):
+        return "проверить"
+    if r < 1.2: return "тело"
+    if r < 1.5: return "тело +10%"
+    if r < 1.8: return "тело +20%"
+    if r < 2.1: return "тело +30%"
+    if r < 2.4: return "тело +40%"
+    if r < 2.7: return "тело +50%"
+    if r < 3.0: return "тело +60%"
+    if r < 3.3: return "тело +70%"
+    if r < 3.7: return "тело +80%"
+    return "тело +90%"
+
+df_calc["категория"] = df_calc.apply(
+    lambda x: category(x[COL_REESTR], x["Соотношение общего долга к телу"]),
+    axis=1
+)
+
+ukf_map = ukf.set_index(normalize_number_like_text(ukf[UKF_DOG]))[UKF_SUM].to_dict()
+tas_map = tas.set_index(normalize_number_like_text(tas[TAS_DOG]))[TAS_SUM].to_dict()
+
+COEF = {
+    "тело":1,"тело +10%":1.1,"тело +20%":1.2,"тело +30%":1.3,
+    "тело +40%":1.4,"тело +50%":1.5,"тело +60%":1.6,
+    "тело +70%":1.7,"тело +80%":1.8,"тело +90%":1.9
+}
+
+def calc_action(r):
+    cat = r["категория"]
+    dog = str(r[COL_DOG]).strip()
+
+    if cat == "не расчитывать":
+        v = ukf_map.get(dog)
+        if v is None or str(v).strip() == "":
+            v = tas_map.get(dog)
+        # если справочник отдал строку-число — пытаемся сделать int
+        try:
+            return int(str(v).replace(" ", "").replace("\xa0", "").replace(",", ".")) if v is not None else None
+        except:
+            return None
+
+    if r["_body"] == 0:
+        return None
+
+    return (r["_body"] * Decimal(str(COEF[cat]))).quantize(Decimal("0.01"))
+
+df_calc["Акция"] = df_calc.apply(calc_action, axis=1)
+
+# приводим к числу (NaN если пусто)
+akc_num = pd.to_numeric(df_calc["Акция"], errors="coerce")
+
+# финал = вниз до 10
+df_calc["АКЦИЯ ФИНАЛ"] = ((akc_num // 10) * 10).astype("Int64")
+
+df_calc["проверка"] = df_calc.apply(
+    lambda x: x["АКЦИЯ ФИНАЛ"] - int(x["_body"]) if pd.notna(x["АКЦИЯ ФИНАЛ"]) else None,
+    axis=1
+)
+df_calc["проверка общего долга"] = df_calc.apply(
+    lambda x: x["АКЦИЯ ФИНАЛ"] - int(x["_total"]) if pd.notna(x["АКЦИЯ ФИНАЛ"]) else None,
+    axis=1
+)
+# ===============================
+# 🚨 ПРОВЕРКА КОРРЕКТНОСТИ РАСЧЁТА АКЦИИ
+# УСЛОВИЯ:
+# 1) проверка <= -2000  → ПРОВЕРИТЬ
+# 2) проверка общего долга > 0 → ПРОВЕРИТЬ
+# ИНАЧЕ → ВСЕ ОК
+# ===============================
+
+mask_bad = (
+    (df_calc["проверка"].notna() & (df_calc["проверка"] <= -2000)) |
+    (df_calc["проверка общего долга"].notna() & (df_calc["проверка общего долга"] > 0))
+)
+
+if mask_bad.any():
+    print("\n🚨 ОБНАРУЖЕНЫ ПРОБЛЕМЫ В РАСЧЁТЕ АКЦИИ:")
+
+    bad_rows = df_calc.loc[
+        mask_bad,
+        [COL_IPN, COL_DOG, "проверка", "проверка общего долга"]
+    ]
+
+    for _, r in bad_rows.iterrows():
+        ipn = str(r[COL_IPN]).strip()
+        dog = str(r[COL_DOG]).strip()
+        chk = r["проверка"]
+        chk_total = r["проверка общего долга"]
+
+        print(
+            f"❗ ПРОВЕРИТЬ РАСЧЕТ АКЦИИ | "
+            f"ІПН {ipn} | ДОГОВОР {dog} | "
+            f"проверка={chk} | проверка общего долга={chk_total}"
+        )
+else:
+    print("\n✅ РАСЧЁТ АКЦИИ ПРОШЁЛ ПРОВЕРКУ. ВСЕ ОК")
+
+df_calc["проверка"]
+df_calc["проверка общего долга"]
+# ===============================
+# 8. ФИНАЛЬНЫЙ ИСХОДНИК
+# ===============================
+df_out = df_src[SRC_COLS_ORIGINAL].copy()
+
+calc_cols = [
+    "Соотношение общего долга к телу",
+    "категория",
+    "Акция",
+    "АКЦИЯ ФИНАЛ",
+    "проверка",
+    "проверка общего долга"
+]
+
+for c in calc_cols:
+    df_out[c] = df_calc[c]
+
+insert_pos = df_out.columns.get_loc(COL_COUNT) + 1
+for c in reversed(calc_cols):
+    df_out.insert(insert_pos, c, df_out.pop(c))
+
+# ===============================
+# ===============================
+# 10. СОХРАНЕНИЕ
+# сохраняем формат исходных колонок
+# расчетные колонки вставляем после COL_COUNT без форматирования
+# ===============================
+
+shutil.copy(SOURCE_FILE, OUT_FILE)
+
+wb = load_workbook(OUT_FILE)
+ws = wb[SRC_SHEET]
+
+# заголовки в Excel
+excel_headers = [cell.value for cell in ws[1]]
+
+# позиция вставки — ПОСЛЕ колонки COL_COUNT
+insert_col = excel_headers.index(COL_COUNT) + 2
+
+# вставляем расчетные колонки
+for col in calc_cols:
+    ws.insert_cols(insert_col)
+    ws.cell(row=1, column=insert_col).value = col
+    insert_col += 1
+
+# записываем значения только в расчетные колонки
+for r, (_, row) in enumerate(df_out.iterrows(), start=2):
+    for i, col in enumerate(calc_cols):
+        val = row[col]
+        ws.cell(
+            row=r,
+            column=excel_headers.index(COL_COUNT) + 2 + i
+        ).value = None if pd.isna(val) else val
+
+wb.save(OUT_FILE)
+
+print("🔍 НЕ ЗАБУДЬ ПРОВЕРИТЬ КОЛОНКИ НА Н/Д И ПОЛНОТУ ЗАПОЛНЕНИЯ!")
+print("✅  ГОТОВО:", OUT_FILE)
