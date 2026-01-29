@@ -1,0 +1,381 @@
+import pandas as pd
+import os
+import re
+from pathlib import Path
+import warnings
+warnings.filterwarnings("ignore", category=pd.errors.DtypeWarning)
+# ===============================
+# 1) ПАПКА
+# ===============================
+BASE_DIR = r"C:\Users\User\Desktop\работа сотрудников"
+OUT_FILE = os.path.join(BASE_DIR, "result.xlsx")
+
+# ===============================
+# 2) ПОИСК ФАЙЛОВ
+# ===============================
+p = Path(BASE_DIR)
+if not p.exists():
+    raise FileNotFoundError(f"Папка не найдена: {BASE_DIR}")
+
+csv_files = sorted([x for x in p.iterdir() if x.is_file() and x.suffix.lower() == ".csv"],
+                   key=lambda x: x.stat().st_mtime, reverse=True)
+xl_files = sorted(
+    [
+        x for x in p.iterdir()
+        if x.is_file()
+        and x.suffix.lower() in (".xlsx", ".xls")
+        and not x.name.lower().startswith("result")
+    ],
+    key=lambda x: x.stat().st_mtime,
+    reverse=True
+)
+
+if not csv_files:
+    raise FileNotFoundError("В папке нет ни одного .csv")
+if not xl_files:
+    raise FileNotFoundError("В папке нет ни одного .xlsx/.xls")
+
+CALLS_FILE = str(csv_files[0])
+REGISTRY_FILE = str(xl_files[0])
+
+# ===============================
+# 3) НОРМАЛИЗАЦИЯ
+# ===============================
+def normalize_phone(x):
+    if pd.isna(x):
+        return None
+    s = re.sub(r"[^\d]", "", str(x))
+    if not s:
+        return None
+    # Часто номера уже в 380..., иногда 0...
+    if s.startswith("38"):
+        return s
+    if s.startswith("0"):
+        return "38" + s
+    return s
+
+def norm_col(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s)).strip().lower()
+
+def normalize_status(x):
+    if pd.isna(x):
+        return None
+    s = str(x).strip().upper()
+    if "ANSWER" in s and "NO" not in s:
+        return "ANSWER"
+    if "BUSY" in s or "NO" in s:
+        return "NO ANSWER"
+    return None
+
+STATUS_PRIORITY = {"ANSWER": 2, "NO ANSWER": 1}
+
+# ===============================
+# 4) ЗАГРУЗКА CSV (с защитой)
+usecols_needed = ["calldate", "dst", "duration", "billsec", "disposition"]
+
+try:
+    calls = pd.read_csv(CALLS_FILE)
+except Exception as e:
+    print("Не удалось прочитать CSV обычным способом. Пробуем engine='python'...")
+    calls = pd.read_csv(CALLS_FILE, engine="python", sep=",", on_bad_lines="skip")
+
+# Проверим, что нужные колонки есть (иногда disposition может быть с другим регистром)
+cols_map = {norm_col(c): c for c in calls.columns}
+missing = [c for c in usecols_needed if c not in cols_map]
+
+if missing:
+    # На случай, если в CSV опечатка в названии disposition
+    # или оно называется 'disposition ' и т.п.
+    print("ВНИМАНИЕ: не найдены ожидаемые колонки:", missing)
+    print("Я вижу такие колонки:", list(calls.columns))
+    raise KeyError("В CSV нет нужных колонок. Смотри вывод выше (Колонки в CSV).")
+
+calls = calls[[cols_map[n] for n in usecols_needed]].copy()
+
+# Типы
+calls["dst"] = calls["dst"].apply(normalize_phone)
+calls["duration"] = pd.to_numeric(calls["duration"], errors="coerce").fillna(0).astype(int)
+calls["billsec"] = pd.to_numeric(calls["billsec"], errors="coerce").fillna(0).astype(int)
+calls["status"] = calls["disposition"].apply(normalize_status)
+calls = calls.dropna(subset=["dst", "status"])
+
+# ===============================
+snowflake = calls[[
+    "calldate",
+    "dst",
+    "duration",
+    "billsec",
+    "disposition"
+]].copy()
+
+# ===============================
+# 5) ЗАГРУЗКА EXCEL + поиск колонки телефона и ФИО сотрудника
+# ===============================
+registry_raw = pd.read_excel(REGISTRY_FILE)
+# Исходник Excel для вкладки "обещания" (без расчётов)
+# ===============================
+promises = registry_raw.copy()
+reg_cols_map = {norm_col(c): c for c in registry_raw.columns}
+
+reg_phone_col = None
+for k, v in reg_cols_map.items():
+    if "номер" in k and ("связ" in k or "телефон" in k):
+        reg_phone_col = v
+        break
+
+if reg_phone_col is None:
+    raise KeyError(
+        f"Не нашёл колонку телефона. Найденные колонки: {list(reg_cols_map.keys())}"
+    )
+
+# Ищем ФИО сотрудника
+emp_candidates = ["фио сотрудника", "сотрудник", "employee", "оператор"]
+reg_emp_col = None
+for cand in emp_candidates:
+    if cand in reg_cols_map:
+        reg_emp_col = reg_cols_map[cand]
+        break
+
+if reg_emp_col is None:
+    raise KeyError("Не нашёл в Excel колонку 'ФИО сотрудника' (или похожую).")
+# ищем колонку ИНН
+inn_col = None
+for k, v in reg_cols_map.items():
+    if k == "инн":
+        inn_col = v
+        break
+
+if inn_col is None:
+    raise KeyError("Не найдена колонка ИНН")
+portfolio_cnt = (
+    registry_raw
+    .dropna(subset=[inn_col, reg_emp_col])
+    .drop_duplicates(subset=[reg_emp_col, inn_col])
+    .groupby(reg_emp_col)
+    .size()
+    .reset_index(name="Всего карточек в портфеле сотрудника")
+)
+# 6) MERGE
+# ===============================
+registry = registry_raw[[reg_phone_col, reg_emp_col]].copy()
+registry["phone"] = registry[reg_phone_col].apply(normalize_phone)
+registry = registry.dropna(subset=["phone"])
+df = calls.merge(
+    registry[["phone", reg_emp_col]],
+    left_on="dst",
+    right_on="phone",
+    how="inner"
+)
+
+df = df.dropna(subset=["status"])
+df["priority"] = df["status"].map(STATUS_PRIORITY).fillna(0).astype(int)
+
+if len(df) == 0:
+    print("Ноль строк после merge. Почти всегда это значит: номера телефонов не совпали по формату.")
+    print("Пример dst из звонков:", calls["dst"].dropna().head(5).tolist())
+    print("Пример phone из реестра:", registry["phone"].dropna().head(5).tolist())
+    raise ValueError("После merge 0 строк — проверь формат телефонов и что CSV/Excel именно те.")
+# ===============================
+# Средняя длительность разговора (billsec) по сотруднику
+# ===============================
+avg_billsec = (
+    df[df["status"] == "ANSWER"]
+    .groupby(reg_emp_col)["billsec"]
+    .mean()
+    .reset_index(name="avg_billsec")
+)
+def sec_to_mmss(x):
+    if pd.isna(x):
+        return "0:00"
+    x = int(round(x))
+    m = x // 60
+    s = x % 60
+    return f"{m}:{s:02d}"
+
+avg_billsec["Средняя длительность разговора"] = avg_billsec["avg_billsec"].apply(sec_to_mmss)
+avg_billsec = avg_billsec.drop(columns=["avg_billsec"])
+
+# ===============================
+# 6.1 Кол-во наборов по клиенту
+
+call_counts_by_status = (
+    df
+    .groupby([reg_emp_col, "dst", "status"])
+    .size()
+    .reset_index(name="call_count")
+)
+# 7) Итоговый статус по клиенту (телефон) с приоритетом
+# ===============================
+client_status = (
+    df.sort_values("priority", ascending=False)
+      .drop_duplicates(subset=["dst", reg_emp_col])
+      [[reg_emp_col, "dst", "status", "billsec"]]
+)
+# подтягиваем call_count ТОЛЬКО по итоговому статусу
+client_status = client_status.merge(
+    call_counts_by_status,
+    on=[reg_emp_col, "dst", "status"],
+    how="left"
+)
+
+client_status["call_count"] = client_status["call_count"].fillna(0).astype(int)
+client_status["answered_45_plus"] = (
+    (client_status["status"] == "ANSWER") &
+    (client_status["billsec"] >= 45)
+)
+
+client_status["answered_less_45"] = (
+    (client_status["status"] == "ANSWER") &
+    (client_status["billsec"] < 45)
+)
+# ===============================
+# 8) Агрегация как в сводной (правильное среднее = SUM / COUNT)
+# ===============================
+pivot = (
+    client_status
+    .groupby([reg_emp_col, "status"], as_index=False)
+    .agg(
+        cards=("dst", "size"),              # сколько карточек (номеров) в этом статусе
+        total_calls=("call_count", "sum")   # сколько всего наборов по этим карточкам
+    )
+)
+pivot["avg_calls"] = (pivot["total_calls"] / pivot["cards"]).round(1)
+# Количество карточек
+cnt_pivot = pivot.pivot(
+    index=reg_emp_col,
+    columns="status",
+    values="cards"
+).fillna(0).reset_index()
+answered_duration = (
+    client_status
+    .groupby(reg_emp_col)
+    .agg(
+        answered_45_plus=("answered_45_plus", "sum"),
+        answered_less_45=("answered_less_45", "sum")
+    )
+    .reset_index()
+)
+
+# Среднее кол-во наборов (SUM/COUNT)
+avg_pivot = pivot.pivot(
+    index=reg_emp_col,
+    columns="status",
+    values="avg_calls"
+).fillna(0).round(1).reset_index()
+
+cnt_pivot = cnt_pivot.set_index(reg_emp_col)
+avg_pivot = avg_pivot.set_index(reg_emp_col)
+cnt_pivot, avg_pivot = cnt_pivot.align(avg_pivot, join="outer", axis=0, fill_value=0)
+cnt_pivot = cnt_pivot.reset_index()
+avg_pivot = avg_pivot.reset_index()
+# ===============================
+# 10) Финальная таблица
+# ===============================
+
+result = pd.DataFrame({
+    reg_emp_col: cnt_pivot[reg_emp_col],
+
+    "ANSWERED": cnt_pivot["ANSWER"],
+    "среднее кол-во наборов по ANSWERED": avg_pivot["ANSWER"],
+
+    "BUSY/NO ANSWERED": cnt_pivot["NO ANSWER"],
+    "среднее кол-во наборов по BUSY/NO ANSWERED": avg_pivot["NO ANSWER"],
+})
+
+result = result.merge(
+    answered_duration,
+    on=reg_emp_col,
+    how="left"
+)
+result = result.merge(
+    avg_billsec,
+    on=reg_emp_col,
+    how="left"
+)
+result = result.rename(columns={
+    "answered_45_plus": "ANSWERED ≥ 45 сек",
+    "answered_less_45": "ANSWERED < 45 сек"
+})
+
+# Общее кол-во проработанных карточек
+result["Общее кол-во проработанных карточек"] = (
+    result["ANSWERED"] + result["BUSY/NO ANSWERED"]
+)
+
+# подтягиваем всего карточек в портфеле
+result = result.merge(
+    portfolio_cnt,
+    on=reg_emp_col,
+    how="left"
+)
+
+result = result.rename(columns={reg_emp_col: "ФИО сотрудника"})
+result = result.fillna(0)
+result = result.reset_index(drop=True)
+# Итог по ИНН
+result = result.reset_index(drop=True)
+result = result[
+    [
+        "ФИО сотрудника",
+        "ANSWERED",
+        "ANSWERED ≥ 45 сек",
+        "ANSWERED < 45 сек",
+        "среднее кол-во наборов по ANSWERED",
+        "BUSY/NO ANSWERED",
+        "среднее кол-во наборов по BUSY/NO ANSWERED",
+        "Общее кол-во проработанных карточек",
+        "Средняя длительность разговора",
+        "Всего карточек в портфеле сотрудника",
+    ]
+]
+# ===============================
+# 11) СТРОКА ИТОГО
+# ===============================
+total_row = {}
+total_row["ФИО сотрудника"] = "ИТОГО"
+# СУММЫ
+sum_cols = [
+    "ANSWERED",
+    "ANSWERED ≥ 45 сек",
+    "ANSWERED < 45 сек",
+    "BUSY/NO ANSWERED",
+    "Общее кол-во проработанных карточек",
+    "Всего карточек в портфеле сотрудника",
+]
+
+for col in sum_cols:
+    total_row[col] = result[col].sum()
+
+# СРЕДНИЕ (округление до 1 знака)
+avg_cols = [
+    "среднее кол-во наборов по ANSWERED",
+    "среднее кол-во наборов по BUSY/NO ANSWERED",
+]
+
+for col in avg_cols:
+    total_row[col] = round(result[col].mean(), 1)
+
+# Средняя длительность разговора (из секунд!)
+avg_seconds = (
+    df[df["status"] == "ANSWER"]["billsec"].mean()
+)
+
+def sec_to_mmss(x):
+    if pd.isna(x):
+        return "0:00"
+    x = int(round(x))
+    return f"{x // 60}:{x % 60:02d}"
+
+total_row["Средняя длительность разговора"] = sec_to_mmss(avg_seconds)
+
+# Добавляем строку в таблицу
+result = pd.concat([result, pd.DataFrame([total_row])], ignore_index=True)
+
+# 9) Сохранение
+# ===============================
+with pd.ExcelWriter(OUT_FILE, engine="openpyxl") as writer:
+    result.to_excel(writer, sheet_name="result", index=False)
+    snowflake.to_excel(writer, sheet_name="снежинка", index=False)
+    promises.to_excel(writer, sheet_name="обещания", index=False)
+
+print("ГОТОВО ✅", OUT_FILE)
