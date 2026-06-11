@@ -1,0 +1,121 @@
+import pandas as pd
+
+file_path = r"C:\Users\kholubenko\OneDrive - Aretail LLC\Рабочий стол\мелкий опт выгрузка.xlsx"
+output_path = r"C:\Users\kholubenko\OneDrive - Aretail LLC\Рабочий стол\результат_мелкий_опт.xlsx"
+
+before_start = pd.to_datetime("19.05.2026", dayfirst=True)
+before_end = pd.to_datetime("01.06.2026", dayfirst=True)
+
+promo_start = pd.to_datetime("02.06.2026", dayfirst=True)
+promo_end = pd.to_datetime("10.06.2026", dayfirst=True)
+
+df = pd.read_excel(file_path)
+df.columns = df.columns.str.strip()
+
+df["Дата"] = pd.to_datetime(df["Дата"], dayfirst=True, errors="coerce")
+
+df["Количество"] = (
+    df["Количество"]
+    .astype(str)
+    .str.replace(",", ".", regex=False)
+    .astype(float)
+)
+
+df = df[
+    ((df["Дата"] >= before_start) & (df["Дата"] <= before_end)) |
+    ((df["Дата"] >= promo_start) & (df["Дата"] <= promo_end))
+].copy()
+
+df["Период"] = df["Дата"].apply(
+    lambda x: "До акции" if before_start <= x <= before_end else "Акция"
+)
+
+# 1. Всего продано по товару за период
+total_sales = (
+    df.groupby(["Период", "Код Товара", "Товар"], as_index=False)
+    .agg(Всего_продано_шт=("Количество", "sum"))
+)
+
+# 2. Собираем чек + СКЮ
+checks = (
+    df.groupby(
+        ["Период", "Магазин", "Номер Чека", "Код Товара", "Товар"],
+        as_index=False
+    )
+    .agg(Количество_в_чеке=("Количество", "sum"))
+)
+
+# 3. Оставляем только чеки, где одного СКЮ было 2+ шт
+opt_checks = checks[checks["Количество_в_чеке"] >= 2].copy()
+
+opt_sales = (
+    opt_checks.groupby(["Период", "Код Товара", "Товар"], as_index=False)
+    .agg(Продано_в_чеках_2плюс_шт=("Количество_в_чеке", "sum"))
+)
+
+# 4. Склеиваем всего + опт
+result = total_sales.merge(
+    opt_sales,
+    on=["Период", "Код Товара", "Товар"],
+    how="left"
+)
+
+result["Продано_в_чеках_2плюс_шт"] = result["Продано_в_чеках_2плюс_шт"].fillna(0)
+
+# 5. Разворачиваем периоды в колонки
+final = result.pivot_table(
+    index=["Код Товара", "Товар"],
+    columns="Период",
+    values=["Всего_продано_шт", "Продано_в_чеках_2плюс_шт"],
+    aggfunc="sum",
+    fill_value=0
+)
+
+final.columns = [f"{period}_{metric}" for metric, period in final.columns]
+final = final.reset_index()
+
+# 6. Добавляем недостающие колонки
+needed_cols = [
+    "До акции_Всего_продано_шт",
+    "До акции_Продано_в_чеках_2плюс_шт",
+    "Акция_Всего_продано_шт",
+    "Акция_Продано_в_чеках_2плюс_шт"
+]
+
+for col in needed_cols:
+    if col not in final.columns:
+        final[col] = 0
+
+# 7. Красивый порядок
+final = final[
+    [
+        "Код Товара",
+        "Товар",
+        "До акции_Всего_продано_шт",
+        "До акции_Продано_в_чеках_2плюс_шт",
+        "Акция_Всего_продано_шт",
+        "Акция_Продано_в_чеках_2плюс_шт"
+    ]
+]
+
+final["Доля 2+ до акции"] = (
+    final["До акции_Продано_в_чеках_2плюс_шт"] /
+    final["До акции_Всего_продано_шт"].replace(0, pd.NA)
+)
+
+final["Доля 2+ акция"] = (
+    final["Акция_Продано_в_чеках_2плюс_шт"] /
+    final["Акция_Всего_продано_шт"].replace(0, pd.NA)
+)
+
+final["Изменение доли 2+, п.п."] = (
+    final["Доля 2+ акция"] - final["Доля 2+ до акции"]
+)
+
+# 8. Сохраняем
+with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    final.to_excel(writer, sheet_name="Итог", index=False)
+    checks.to_excel(writer, sheet_name="Чеки_СКЮ", index=False)
+
+print("Готово!")
+print(output_path)
