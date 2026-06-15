@@ -1,0 +1,131 @@
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+input_path = Path(r"C:\Users\kholubenko\OneDrive - Aretail LLC\Рабочий стол\баядера првоерить.xlsx")
+output_path = input_path.with_name(input_path.stem + "_проверить_adu.xlsx")
+
+# читаем файл
+df = pd.read_excel(input_path)
+
+# приводим к числу
+df["ADU"] = pd.to_numeric(df["ADU"], errors="coerce")
+df["Прогнозный АДУ"] = pd.to_numeric(df["Прогнозный АДУ"], errors="coerce")
+df["Продажи (прогноз)"] = pd.to_numeric(df["Продажи (прогноз)"], errors="coerce")
+
+# только активные товары
+df = df[df["Статус"].astype(str).str.strip().str.upper() == "MTS"].copy()
+
+# СНАЧАЛА создаем прогноз от модуля
+df["Прогноз от модуля"] = df["Продажи (прогноз)"]
+
+# ПОТОМ считаем дни акции
+df["Дни акции"] = np.where(
+    df["Прогнозный АДУ"] > 0,
+    np.maximum(1, (df["Прогноз от модуля"] / df["Прогнозный АДУ"]).round()),
+    np.nan
+)
+
+# прогноз продаж по обычному ADU
+df["Прогноз продаж по ADU"] = np.where(
+    df["Дни акции"] > 0,
+    df["ADU"] * df["Дни акции"],
+    np.nan
+)
+
+# сравнение ADU
+df["Кратность к обычному ADU"] = np.where(
+    df["ADU"] > 0,
+    df["Прогнозный АДУ"] / df["ADU"],
+    np.nan
+)
+
+df["Превышение, %"] = np.where(
+    df["ADU"] > 0,
+    (df["Прогнозный АДУ"] / df["ADU"] - 1) * 100,
+    np.nan
+)
+
+# тип
+df["Тип"] = np.where(
+    (df["ADU"] > 0) & (df["Прогнозный АДУ"] > df["ADU"] * 1.5),
+    "Превышение > 50%",
+    np.where(
+        (df["ADU"] == 0) & (df["Прогнозный АДУ"] > 0),
+        "ADU = 0, но прогнозный ADU есть",
+        "ОК"
+    )
+)
+
+# фильтр проблемных строк
+df_bad = df[
+    (df["Прогноз от модуля"] > 3) & (
+        ((df["ADU"] > 0) & (df["Прогнозный АДУ"] > df["ADU"] * 1.5)) |
+        ((df["ADU"] == 0) & (df["Прогнозный АДУ"] > 0))
+    )
+].copy()
+# код товара
+df_bad["Код товара"] = (
+    pd.to_numeric(df_bad["SKU"], errors="coerce")
+    .fillna(0)
+    .astype(int)
+    .astype(str)
+    .str.zfill(9)
+)
+
+# код магазина
+df_bad["Код магазина"] = (
+    pd.to_numeric(df_bad["Код склада"], errors="coerce")
+    .fillna(0)
+    .astype(int)
+    .astype(str)
+    .str.zfill(3)
+)
+
+# округление
+df_bad["ADU"] = df_bad["ADU"].round(3)
+df_bad["Прогнозный АДУ"] = df_bad["Прогнозный АДУ"].round(3)
+df_bad["Прогноз продаж по ADU"] = df_bad["Прогноз продаж по ADU"].round(3)
+df_bad["Прогноз от модуля"] = df_bad["Прогноз от модуля"].round(3)
+df_bad["Кратность к обычному ADU"] = df_bad["Кратность к обычному ADU"].round(2)
+df_bad["Превышение, %"] = df_bad["Превышение, %"].round(1)
+df_bad["Приоритет"] = np.where(
+    df_bad["Тип"] == "Превышение > 50%",
+    1,
+    2
+)
+# итог
+result = df_bad[[
+    "Код товара",
+    "Код магазина",
+    "Название",
+    "Дни акции",
+    "ADU",
+    "Начальное ADU",
+
+    "Прогноз продаж по ADU",
+    "Прогноз от модуля"
+
+]].copy()
+
+result = result.sort_values(
+    by=["Прогноз от модуля"],
+    ascending=False,
+    na_position="last"
+)
+
+
+# выгрузка
+with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    result.to_excel(writer, sheet_name="Все SKU", index=False)
+
+    for sku, group in result.groupby("Код товара"):
+        sheet_name = str(sku)
+        for ch in ['\\', '/', '*', '?', ':', '[', ']']:
+            sheet_name = sheet_name.replace(ch, "_")
+        sheet_name = sheet_name[:31]
+        group.to_excel(writer, sheet_name=sheet_name, index=False)
+
+print("Готово:", output_path)
+print("Сомнительных строк:", len(result))
+print("SKU на отдельных листах:", result["Код товара"].nunique())
