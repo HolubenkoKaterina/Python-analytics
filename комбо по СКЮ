@@ -1,0 +1,165 @@
+import pandas as pd
+
+# =========================
+# НАСТРОЙКИ
+# =========================
+promo_name = "кофе + вафли"
+
+file_path = r"C:\Users\kholubenko\OneDrive - Aretail LLC\Рабочий стол\комбо кофе + вафля.xlsx"
+output_path = r"C:\Users\kholubenko\OneDrive - Aretail LLC\Рабочий стол\результат_по_магазинам.xlsx"
+
+group1_codes = ["000043229", "000069140"]
+group2_codes = [
+    "000064489"]
+    
+
+store_col = 'Магазин'
+product_name_col = 'Товар'
+product_code_col = 'Код Товара'
+receipt_col = 'Номер Чека'
+date_col = 'Дата'
+qty_col = 'Количество'
+
+# =========================
+# ЗАГРУЗКА
+# =========================
+df = pd.read_excel(file_path, dtype={product_code_col: str})
+
+# =========================
+# ПОДГОТОВКА
+# =========================
+df[product_code_col] = (
+    df[product_code_col]
+    .astype(str)
+    .str.replace('.0', '')
+    .str.strip()
+    .str.zfill(9)
+)
+
+df[store_col] = df[store_col].astype(str).str.strip()
+
+df[receipt_col] = (
+    df[receipt_col]
+    .astype(str)
+    .str.replace('.0', '')
+    .str.strip()
+)
+
+df[date_col] = pd.to_datetime(df[date_col], format='%d.%m.%Y', errors='coerce')
+
+# 🔥 УБИРАЕМ ДРОБИ
+df[qty_col] = (
+    df[qty_col]
+    .astype(str)
+    .str.replace(' ', '')
+    .str.replace(',', '.')
+    .astype(float)
+    .round()
+    .astype(int)
+)
+
+# =========================
+# ФИЛЬТР
+# =========================
+promo_codes = group1_codes + group2_codes
+df_promo = df[df[product_code_col].isin(promo_codes)].copy()
+
+# =========================
+# ФЛАГИ
+# =========================
+df_promo['is_g1'] = df_promo[product_code_col].isin(group1_codes)
+df_promo['is_g2'] = df_promo[product_code_col].isin(group2_codes)
+
+df_promo['qty_g1'] = df_promo[qty_col].where(df_promo['is_g1'], 0)
+df_promo['qty_g2'] = df_promo[qty_col].where(df_promo['is_g2'], 0)
+
+# =========================
+# КОМБО = min
+# =========================
+checks = (
+    df_promo.groupby([store_col, receipt_col, date_col], as_index=False)
+    .agg(qty_g1=('qty_g1', 'sum'),
+         qty_g2=('qty_g2', 'sum'))
+)
+
+checks['Комбо, шт'] = checks[['qty_g1', 'qty_g2']].min(axis=1)
+
+checks = checks[checks['Комбо, шт'] > 0]
+
+total_combo = int(checks['Комбо, шт'].sum())
+
+# =========================
+# ПОДТЯГИВАЕМ ЧЕКИ
+# =========================
+df_combo = df_promo.merge(
+    checks[[store_col, receipt_col, date_col, 'Комбо, шт']],
+    on=[store_col, receipt_col, date_col],
+    how='inner'
+)
+
+# =========================
+# ПЕРВЫЙ КРУАССАН
+# =========================
+g1 = (
+    df_combo[df_combo['is_g1']]
+    .sort_values([store_col, receipt_col, date_col, product_code_col])
+    .drop_duplicates([store_col, receipt_col, date_col])
+    [[store_col, receipt_col, date_col, product_name_col, 'Комбо, шт']]
+    .rename(columns={product_name_col: 'Круассан'})
+)
+
+# =========================
+# ПЕРВЫЙ КОФЕ
+# =========================
+g2 = (
+    df_combo[df_combo['is_g2']]
+    .sort_values([store_col, receipt_col, date_col, product_code_col])
+    .drop_duplicates([store_col, receipt_col, date_col])
+    [[store_col, receipt_col, date_col, product_name_col]]
+    .rename(columns={product_name_col: 'Кофе'})
+)
+
+# =========================
+# ПАРЫ
+# =========================
+pairs = g1.merge(
+    g2,
+    on=[store_col, receipt_col, date_col],
+    how='inner'
+)
+
+pairs['Пара товаров'] = pairs['Круассан'] + ' + ' + pairs['Кофе']
+
+pairs_summary = (
+    pairs.groupby('Пара товаров', as_index=False)['Комбо, шт']
+    .sum()
+    .sort_values(by='Комбо, шт', ascending=False)
+)
+
+# =========================
+# ПО МАГАЗИНАМ
+# =========================
+combo_by_store = (
+    checks.groupby(store_col, as_index=False)['Комбо, шт']
+    .sum()
+    .sort_values(by='Комбо, шт', ascending=False)
+)
+
+# =========================
+# ВЫВОД
+# =========================
+print(f"\nАкция: {promo_name}")
+print(f"\nКомбо, шт: {total_combo}")
+print(f"Магазинов с комбо: {combo_by_store[store_col].nunique()}")
+
+print("\nПары товаров:")
+print(pairs_summary.to_string(index=False))
+
+# =========================
+# СОХРАНЕНИЕ
+# =========================
+with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+    combo_by_store.to_excel(writer, sheet_name='Комбо по магазинам', index=False)
+    pairs_summary.to_excel(writer, sheet_name='Пары товаров', index=False)
+
+print(f"\nФайл сохранён: {output_path}")
