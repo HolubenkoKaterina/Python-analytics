@@ -1,0 +1,178 @@
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+# =========================
+# 1. Путь
+# =========================
+file_path = Path(r"C:\Users\kholubenko\OneDrive - Aretail LLC\Рабочий стол\Лист Microsoft Excel (2).xlsx")
+sheet_name = "итог"
+
+# =========================
+# 2. Чтение
+# =========================
+df = pd.read_excel(file_path, sheet_name=sheet_name)
+
+# =========================
+# 3. Очистка колонок
+# =========================
+df.columns = df.columns.astype(str).str.strip()
+
+# фикс warning pandas
+for col in df.select_dtypes(include=["object", "string"]).columns:
+    df[col] = df[col].astype(str).str.strip()
+
+# =========================
+# 4. Числа
+# =========================
+for col in ["Значение_2024", "Значение_2025", "месяц"]:
+    df[col] = (
+        df[col]
+        .astype(str)
+        .str.replace(" ", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# =========================
+# 5. Формат магазина
+# =========================
+df["формат магазина"] = df.get("формат магазина", "без группы")
+
+df["формат магазина"] = df["формат магазина"].replace(
+    ["н/д", "Н/Д", "nan", "None", ""],
+    "без группы"
+)
+
+df["формат магазина"] = df["формат магазина"].fillna("без группы")
+
+# =========================
+# 6. Мотивация
+# =========================
+df["группа_мотивации"] = np.where(
+    df["Column2"].astype(str).str.lower().str.contains("мотива", na=False),
+    "мотивация",
+    "без мотивации"
+)
+
+# =========================
+# 7. Очистка строк
+# =========================
+df_clean = df.dropna(subset=["Значение_2024", "Значение_2025", "месяц"]).copy()
+df_clean = df_clean[df_clean["Значение_2024"] > 0].copy()
+
+# =========================
+# 8. % изменение
+# =========================
+df_clean["изменение_%"] = (
+    (df_clean["Значение_2025"] - df_clean["Значение_2024"]) /
+    df_clean["Значение_2024"] * 100
+)
+
+# =========================
+# 9. ФИКС ВЫБРОСОВ
+# =========================
+df_clean["выброс"] = np.where(
+    (df_clean["изменение_%"] < -100) | (df_clean["изменение_%"] > 200),
+    1, 0
+)
+
+outliers_share = df_clean["выброс"].mean()
+
+# убираем выбросы
+df_filtered = df_clean[df_clean["выброс"] == 0].copy()
+
+# =========================
+# 10. Сводка (главная!)
+# =========================
+summary = (
+    df_filtered
+    .groupby("группа_мотивации")
+    .agg(
+        колво=("изменение_%", "size"),
+        среднее=("изменение_%", "mean"),
+        медиана=("изменение_%", "median")
+    )
+    .reset_index()
+)
+
+# =========================
+# 11. Вывод гипотезы
+# =========================
+mot = summary.loc[summary["группа_мотивации"] == "мотивация", "медиана"].values
+no_mot = summary.loc[summary["группа_мотивации"] == "без мотивации", "медиана"].values
+
+if len(mot) > 0 and len(no_mot) > 0:
+    mot = mot[0]
+    no_mot = no_mot[0]
+
+    if mot > no_mot:
+        conclusion = "Гипотеза подтверждается: у магазинов с мотивацией падение меньше."
+    elif mot < no_mot:
+        conclusion = "Гипотеза не подтверждается: мотивация не улучшает динамику."
+    else:
+        conclusion = "Разницы между группами не выявлено."
+else:
+    conclusion = "Недостаточно данных."
+# =========================
+# АНАЛИЗ ПО ФОРМАТАМ
+# =========================
+format_analysis = (
+    df_filtered
+    .groupby(["формат магазина", "группа_мотивации"])
+    .agg(
+        колво=("изменение_%", "size"),
+        среднее=("изменение_%", "mean"),
+        медиана=("изменение_%", "median")
+    )
+    .reset_index()
+    .sort_values(["формат магазина", "группа_мотивации"])
+)
+
+# =========================
+# РАЗНИЦА ВНУТРИ ФОРМАТА
+# =========================
+pivot_format = (
+    format_analysis
+    .pivot(index="формат магазина", columns="группа_мотивации", values="медиана")
+    .reset_index()
+)
+
+# считаем эффект мотивации
+pivot_format["эффект_мотивации"] = (
+    pivot_format["мотивация"] - pivot_format["без мотивации"]
+)
+
+# сортировка
+pivot_format = pivot_format.sort_values("эффект_мотивации", ascending=False)
+# =========================
+# =========================
+# АНАЛИЗ ПО ФОРМАТАМ
+# =========================
+format_analysis = (
+    df_filtered
+    .groupby(["формат магазина", "группа_мотивации"])
+    .agg(
+        колво=("изменение_%", "size"),
+        среднее=("изменение_%", "mean"),
+        медиана=("изменение_%", "median")
+    )
+    .reset_index()
+)
+
+
+# =========================
+# СОХРАНЕНИЕ
+# =========================
+output_path = file_path.with_name(file_path.stem + "_анализ_чистый.xlsx")
+
+with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    df_clean.to_excel(writer, sheet_name="до_очистки", index=False)
+    df_filtered.to_excel(writer, sheet_name="после_очистки", index=False)
+    summary.to_excel(writer, sheet_name="сводка", index=False)
+
+    # ВОТ ЭТО ВАЖНО
+    format_analysis.to_excel(writer, sheet_name="по_форматам", index=False)
+    pivot_format.to_excel(writer, sheet_name="эффект_по_форматам", index=False)
+
+print("Готово.")
