@@ -1,0 +1,143 @@
+import pandas as pd
+
+file_path = r"C:\Users\kholubenko\OneDrive - Aretail LLC\Рабочий стол\ОПТ.xlsx"
+output_path = r"C:\Users\kholubenko\OneDrive - Aretail LLC\Рабочий стол\результат_мелкий_опт.xlsx"
+
+# Период акции
+promo_start = pd.to_datetime("11.08.2026", dayfirst=True)
+promo_end = pd.to_datetime("17.08.2026", dayfirst=True)
+
+# Загружаем файл
+df = pd.read_excel(file_path)
+df.columns = df.columns.str.strip()
+
+# Приводим дату
+df["Дата"] = pd.to_datetime(
+    df["Дата"],
+    dayfirst=True,
+    errors="coerce"
+)
+
+# Приводим количество к числу
+df["Количество"] = (
+    df["Количество"]
+    .astype(str)
+    .str.replace(",", ".", regex=False)
+    .astype(float)
+)
+
+# Оставляем только период акции
+df = df[
+    (df["Дата"] >= promo_start) &
+    (df["Дата"] <= promo_end)
+].copy()
+
+
+# 1. Общее количество проданных штук каждой позиции
+total_sales = (
+    df.groupby(
+        ["Код Товара", "Товар"],
+        as_index=False
+    )
+    .agg(
+        Всего_продано_шт=("Количество", "sum")
+    )
+)
+
+
+# 2. Собираем чек + магазин + СКЮ
+checks = (
+    df.groupby(
+        [
+            "Магазин",
+            "Номер Чека",
+            "Код Товара",
+            "Товар"
+        ],
+        as_index=False
+    )
+    .agg(
+        Количество_в_чеке=("Количество", "sum")
+    )
+)
+
+
+# 3. Оставляем только чеки,
+# где одной позиции было продано 2 или больше штук
+opt_checks = checks[
+    checks["Количество_в_чеке"] >= 2
+].copy()
+
+
+# 4. Сколько всего штук каждой позиции
+# было продано в таких чеках
+opt_sales = (
+    opt_checks.groupby(
+        ["Код Товара", "Товар"],
+        as_index=False
+    )
+    .agg(
+        Продано_в_чеках_2плюс_шт=("Количество_в_чеке", "sum")
+    )
+)
+
+
+# 5. Объединяем общее количество и количество
+# в чеках 2+
+result = total_sales.merge(
+    opt_sales,
+    on=["Код Товара", "Товар"],
+    how="left"
+)
+
+result["Продано_в_чеках_2плюс_шт"] = (
+    result["Продано_в_чеках_2плюс_шт"]
+    .fillna(0)
+)
+
+
+# 6. Считаем долю продаж 2+ от общего количества
+result["Доля_2плюс"] = (
+    result["Продано_в_чеках_2плюс_шт"] /
+    result["Всего_продано_шт"].replace(0, pd.NA)
+)
+
+
+# 7. В процентах
+result["Доля_2плюс_%"] = (
+    result["Доля_2плюс"] * 100
+)
+
+
+# 8. Оставляем нужные колонки
+final = result[
+    [
+        "Код Товара",
+        "Товар",
+        "Всего_продано_шт",
+        "Продано_в_чеках_2плюс_шт",
+        "Доля_2плюс_%"
+    ]
+].copy()
+
+
+# 9. Округление
+final["Доля_2плюс_%"] = final["Доля_2плюс_%"].round(2)
+
+
+# 10. Сохраняем
+with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    final.to_excel(
+        writer,
+        sheet_name="Итог",
+        index=False
+    )
+
+    checks.to_excel(
+        writer,
+        sheet_name="Чеки_СКЮ",
+        index=False
+    )
+
+print("Готово!")
+print(output_path)
