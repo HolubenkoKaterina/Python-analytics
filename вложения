@@ -1,0 +1,64 @@
+products = [
+    {"name": "Ноутбук", "price": 30000, "quantity": 2},
+    {"name": "Мышка", "price": 800, "quantity": 5},
+    {"name": "Клавиатура", "price": 1500, "quantity": 3}
+]
+# Выведи весь первый словарь.
+print(products[0])
+# Выведи название первого товара.
+print(products[0]["name"])
+# Выведи цену второго товара.
+print(products[1]["price"])
+# Выведи количество третьего товара.
+print(products[2]["quantity"])
+# Выведи название последнего товара.
+print(products[2]["name"])
+
+sales = [
+    {
+        "store": "Киев",
+        "products": [
+            {"name": "Ноутбук", "quantity": 2},
+            {"name": "Мышка", "quantity": 5}
+        ]
+    },
+    {
+        "store": "Львов",
+        "products": [
+            {"name": "Ноутбук", "quantity": 3},
+            {"name": "Клавиатура", "quantity": 4}
+        ]
+    }
+]
+# Выведи название первого магазина.
+print(sales[0]["store"])
+# Выведи название второго магазина.
+print(sales[1]["name"])
+# Выведи список товаров первого магазина.
+print(sales[0]["products"])
+# Выведи первый товар первого магазина целиком.
+print(sales[0]["products"][0])
+# Выведи название первого товара первого магазина.
+print(sales[0]["products"][0])
+# Выведи количество мышек в первом магазине.
+print(sales[0]["products"][1]['quantity'])
+# Выведи название второго товара второго магазина.
+print(sales[1]["products"][1]['name'])
+# Выведи количество клавиатур во втором магазине.
+print(sales[1]["products"][1]["quantity"])
+
+products = [
+    {"name": "Хлеб", "price": 40, "quantity": 3},
+    {"name": "Молоко", "price": 55, "quantity": 2},
+    {"name": "Сыр", "price": 180, "quantity": 1}
+]
+# Выведи название второго товара.
+print(products[1]["name"])
+# Выведи цену первого товара.
+print(products[0]["price"])
+# Выведи количество сыра.
+print(products[2]["quantity"])
+# Выведи цену последнего товара.
+print(products[2]['price'])
+# Выведи весь словарь с молоком.
+print(products[1])
